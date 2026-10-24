@@ -17,6 +17,52 @@
       ],
       "type": "object"
     },
+    "Brand": {
+      "properties": {
+        "chat": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatBrand"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mark": {
+          "description": "A named mark/logo id the frontend knows how to render (e.g.\n`\"lula\"`); unrecognized values just render no mark.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
+    "ChatBrand": {
+      "description": "Copy for the chat panel's static shell. There is no live agent behind\nit -- this only customizes the header status line and composer\nplaceholder text, not conversation content.",
+      "properties": {
+        "placeholder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "Component": {
       "properties": {
         "action": {
@@ -28,7 +74,15 @@
               "type": "null"
             }
           ],
-          "default": null
+          "default": null,
+          "description": "A single write binding, for components that only ever need one\n(a kanban's drag action, a single-button form). Mutually usable\nalongside `actions` below; `all_actions` sees both."
+        },
+        "actions": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ActionBinding"
+          },
+          "description": "Named write bindings, for components that offer more than one verb\non a row -- e.g. a proposal list's `accept`/`reject`, a lead list's\n`accept`/`reject`/`snooze`. Keys are an app author's choice of label\nfor each button; the frontend decides presentation per key, this is\njust storage and validation.",
+          "type": "object"
         },
         "id": {
           "type": "string"
@@ -163,6 +217,22 @@
         }
       ]
     },
+    "NavItem": {
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "path": {
+          "description": "Must equal some page's `path` exactly.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "path"
+      ],
+      "type": "object"
+    },
     "Page": {
       "properties": {
         "components": {
@@ -215,6 +285,24 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "brand": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Brand"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "App-level branding: display name, mark, and the (static -- no live\nagent) chat shell's copy. Optional so a minimal app definition\ndoesn't need to author it."
+    },
+    "nav": {
+      "description": "Top-level navigation links, rendered in the top bar. Each `path`\nmust equal some page's `path`.",
+      "items": {
+        "$ref": "#/$defs/NavItem"
+      },
+      "type": "array"
+    },
     "pages": {
       "items": {
         "$ref": "#/$defs/Page"

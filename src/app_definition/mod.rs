@@ -25,6 +25,7 @@ use crate::error::{AppError, AppResult};
 /// Actions a component's `action` binding may name; each maps to an
 /// existing endpoint on the backend.
 pub const KNOWN_ACTIONS: &[&str] = &[
+    "opportunity.create",
     "opportunity.update_stage",
     "paste.submit",
     "proposal.accept",
@@ -41,7 +42,45 @@ pub struct AppDefinitionDoc {
     /// The app definition schema format version (not the app's own
     /// version number, which is `app_definition_versions.version`).
     pub version: u32,
+    /// App-level branding: display name, mark, and the (static -- no live
+    /// agent) chat shell's copy. Optional so a minimal app definition
+    /// doesn't need to author it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
+    /// Top-level navigation links, rendered in the top bar. Each `path`
+    /// must equal some page's `path`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nav: Vec<NavItem>,
     pub pages: Vec<Page>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
+pub struct Brand {
+    pub title: String,
+    /// A named mark/logo id the frontend knows how to render (e.g.
+    /// `"lula"`); unrecognized values just render no mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatBrand>,
+}
+
+/// Copy for the chat panel's static shell. There is no live agent behind
+/// it -- this only customizes the header status line and composer
+/// placeholder text, not conversation content.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
+pub struct ChatBrand {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
+pub struct NavItem {
+    pub label: String,
+    /// Must equal some page's `path` exactly.
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
@@ -121,8 +160,18 @@ pub struct Component {
     pub title: Option<String>,
     #[serde(default)]
     pub query: Option<QueryBinding>,
+    /// A single write binding, for components that only ever need one
+    /// (a kanban's drag action, a single-button form). Mutually usable
+    /// alongside `actions` below; `all_actions` sees both.
     #[serde(default)]
     pub action: Option<ActionBinding>,
+    /// Named write bindings, for components that offer more than one verb
+    /// on a row -- e.g. a proposal list's `accept`/`reject`, a lead list's
+    /// `accept`/`reject`/`snooze`. Keys are an app author's choice of label
+    /// for each button; the frontend decides presentation per key, this is
+    /// just storage and validation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actions: BTreeMap<String, ActionBinding>,
     /// Component-specific configuration: chart `chart_type`/`encoding`,
     /// table `columns`, form `fields`, kanban `group_field`, etc. --
     /// deliberately open-ended so the fixed `ComponentKind`s don't need a
@@ -131,6 +180,20 @@ pub struct Component {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub props: serde_json::Map<String, Value>,
+}
+
+impl Component {
+    /// Every action binding this component carries, combining the single
+    /// `action` (keyed `"default"`) and the named `actions` map, so
+    /// validation can check both forms uniformly.
+    pub fn all_actions(&self) -> Vec<(&str, &ActionBinding)> {
+        let mut out: Vec<(&str, &ActionBinding)> =
+            self.actions.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        if let Some(action) = &self.action {
+            out.push(("default", action));
+        }
+        out
+    }
 }
 
 /// Validate shape (pure, no I/O) and, given `pool`, that every saved-query
@@ -164,6 +227,7 @@ pub async fn validate(
 /// caller to check against the workspace's actual saved queries.
 fn validate_shape(doc: &AppDefinitionDoc) -> AppResult<Vec<&str>> {
     let mut page_ids = BTreeSet::new();
+    let mut page_paths = BTreeSet::new();
     let mut query_keys = Vec::new();
     for page in &doc.pages {
         if !page_ids.insert(page.id.as_str()) {
@@ -172,6 +236,7 @@ fn validate_shape(doc: &AppDefinitionDoc) -> AppResult<Vec<&str>> {
                 page.id
             )));
         }
+        page_paths.insert(page.path.as_str());
         let route_params = route_params(&page.path);
         let mut component_ids = BTreeSet::new();
         for component in &page.components {
@@ -186,10 +251,10 @@ fn validate_shape(doc: &AppDefinitionDoc) -> AppResult<Vec<&str>> {
                 query_keys.push(query.query.as_str());
                 check_route_refs(&query.params, &route_params, page.id.as_str())?;
             }
-            if let Some(action) = &component.action {
+            for (name, action) in component.all_actions() {
                 if !KNOWN_ACTIONS.contains(&action.action.as_str()) {
                     return Err(AppError::BadRequest(format!(
-                        "component `{}` uses unknown action `{}`",
+                        "component `{}` action `{name}` uses unknown action `{}`",
                         component.id, action.action
                     )));
                 }
@@ -197,6 +262,14 @@ fn validate_shape(doc: &AppDefinitionDoc) -> AppResult<Vec<&str>> {
             }
         }
         check_layout_refs(&page.layout, &component_ids, page.id.as_str())?;
+    }
+    for nav in &doc.nav {
+        if !page_paths.contains(nav.path.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "nav item `{}` references unknown page path `{}`",
+                nav.label, nav.path
+            )));
+        }
     }
     Ok(query_keys)
 }
@@ -218,14 +291,14 @@ fn validate_component(component: &Component) -> AppResult<()> {
         )));
     }
     let needs_action = matches!(component.kind, ComponentKind::Form);
-    if needs_action && component.action.is_none() {
+    if needs_action && component.all_actions().is_empty() {
         return Err(AppError::BadRequest(format!(
-            "component `{}` ({:?}) needs an `action` binding",
+            "component `{}` ({:?}) needs an `action` or `actions` binding",
             component.id, component.kind
         )));
     }
     if component.kind == ComponentKind::Kanban {
-        if component.action.is_none() {
+        if component.all_actions().is_empty() {
             return Err(AppError::BadRequest(format!(
                 "component `{}` (Kanban) needs an `action` binding for moving cards",
                 component.id
@@ -349,6 +422,8 @@ mod tests {
     fn rejects_duplicate_component_ids() {
         let doc = AppDefinitionDoc {
             version: 1,
+            brand: None,
+            nav: Vec::new(),
             pages: vec![Page {
                 id: "p".to_owned(),
                 path: "/p".to_owned(),
@@ -364,6 +439,7 @@ mod tests {
                             params: BTreeMap::new(),
                         }),
                         action: None,
+                        actions: BTreeMap::new(),
                         props: serde_json::Map::new(),
                     },
                     Component {
@@ -375,6 +451,7 @@ mod tests {
                             params: BTreeMap::new(),
                         }),
                         action: None,
+                        actions: BTreeMap::new(),
                         props: serde_json::Map::new(),
                     },
                 ],
@@ -389,6 +466,8 @@ mod tests {
         params.insert("id".to_owned(), Value::String("$route.missing".to_owned()));
         let doc = AppDefinitionDoc {
             version: 1,
+            brand: None,
+            nav: Vec::new(),
             pages: vec![Page {
                 id: "p".to_owned(),
                 path: "/p/:known".to_owned(),
@@ -405,10 +484,106 @@ mod tests {
                         params,
                     }),
                     action: None,
+                    actions: BTreeMap::new(),
                     props: serde_json::Map::new(),
                 }],
             }],
         };
+        assert!(validate_shape(&doc).is_err());
+    }
+
+    fn component_with_actions(actions: BTreeMap<String, ActionBinding>) -> Component {
+        Component {
+            id: "c".to_owned(),
+            kind: ComponentKind::List,
+            title: None,
+            query: Some(QueryBinding {
+                query: "q".to_owned(),
+                params: BTreeMap::new(),
+            }),
+            action: None,
+            actions,
+            props: serde_json::Map::new(),
+        }
+    }
+
+    fn single_component_doc(component: Component) -> AppDefinitionDoc {
+        AppDefinitionDoc {
+            version: 1,
+            brand: None,
+            nav: Vec::new(),
+            pages: vec![Page {
+                id: "p".to_owned(),
+                path: "/p".to_owned(),
+                title: "P".to_owned(),
+                layout: LayoutNode::Component {
+                    component_id: "c".to_owned(),
+                },
+                components: vec![component],
+            }],
+        }
+    }
+
+    #[test]
+    fn accepts_multiple_named_actions() {
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "accept".to_owned(),
+            ActionBinding {
+                action: "proposal.accept".to_owned(),
+                params: BTreeMap::new(),
+            },
+        );
+        actions.insert(
+            "reject".to_owned(),
+            ActionBinding {
+                action: "proposal.reject".to_owned(),
+                params: BTreeMap::new(),
+            },
+        );
+        let doc = single_component_doc(component_with_actions(actions));
+        assert!(validate_shape(&doc).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_action_in_actions_map() {
+        let mut actions = BTreeMap::new();
+        actions.insert(
+            "bogus".to_owned(),
+            ActionBinding {
+                action: "not.a.real.action".to_owned(),
+                params: BTreeMap::new(),
+            },
+        );
+        let doc = single_component_doc(component_with_actions(actions));
+        assert!(validate_shape(&doc).is_err());
+    }
+
+    #[test]
+    fn accepts_nav_referencing_a_real_page_path() {
+        let mut doc = single_component_doc(component_with_actions(BTreeMap::new()));
+        doc.brand = Some(Brand {
+            title: "Jack's Sales".to_owned(),
+            mark: Some("lula".to_owned()),
+            chat: Some(ChatBrand {
+                status: Some("Building Jack's Sales".to_owned()),
+                placeholder: Some("Ask Lula to change this app…".to_owned()),
+            }),
+        });
+        doc.nav = vec![NavItem {
+            label: "P".to_owned(),
+            path: "/p".to_owned(),
+        }];
+        assert!(validate_shape(&doc).is_ok());
+    }
+
+    #[test]
+    fn rejects_nav_referencing_unknown_page_path() {
+        let mut doc = single_component_doc(component_with_actions(BTreeMap::new()));
+        doc.nav = vec![NavItem {
+            label: "Nowhere".to_owned(),
+            path: "/nowhere".to_owned(),
+        }];
         assert!(validate_shape(&doc).is_err());
     }
 }
