@@ -30,6 +30,8 @@ pub const KNOWN_ACTIONS: &[&str] = &[
     "paste.submit",
     "proposal.accept",
     "proposal.reject",
+    "proposal.unaccept",
+    "proposal.unreject",
     "task.create",
     "task.complete",
     "lead.accept",
@@ -90,9 +92,30 @@ pub struct Page {
     /// are route params a binding can reference as `$route.<name>`.
     pub path: String,
     pub title: String,
+    /// Optional subtitle and inline actions rendered on the title row,
+    /// instead of `title` standing alone. A page that doesn't author one
+    /// just gets the bare `title`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<PageHeader>,
     pub layout: LayoutNode,
     #[serde(default)]
     pub components: Vec<Component>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ToSchema)]
+pub struct PageHeader {
+    /// A query whose first row fills `subtitle_template`'s `{field}`
+    /// tokens, e.g. `"{deal_count} deals across {stage_count} stages"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<QueryBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_template: Option<String>,
+    /// Ids of this page's own `components`, rendered inline on the title
+    /// row (e.g. a "New deal" form's trigger button) instead of in
+    /// `layout`'s normal flow. Each must still be one of the page's
+    /// `components`; it is simply not also placed in `layout`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
 }
 
 /// Layout primitives. A `component` leaf names one of `Page::components` by
@@ -107,6 +130,15 @@ pub enum LayoutNode {
     Column {
         #[serde(default)]
         children: Vec<Self>,
+        /// A fixed CSS width (e.g. `"320px"`), for a column that shouldn't
+        /// grow with its siblings -- a narrow details rail beside a wider
+        /// activity column, say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<String>,
+        /// A flex-grow factor relative to sibling columns in the same row
+        /// that also set one (both default to `1` otherwise).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flex: Option<u32>,
     },
     Section {
         title: Option<String>,
@@ -261,6 +293,20 @@ fn validate_shape(doc: &AppDefinitionDoc) -> AppResult<Vec<&str>> {
                 check_route_refs(&action.params, &route_params, page.id.as_str())?;
             }
         }
+        if let Some(header) = &page.header {
+            if let Some(subtitle) = &header.subtitle {
+                query_keys.push(subtitle.query.as_str());
+                check_route_refs(&subtitle.params, &route_params, page.id.as_str())?;
+            }
+            for action_id in &header.actions {
+                if !component_ids.contains(action_id.as_str()) {
+                    return Err(AppError::BadRequest(format!(
+                        "page `{}` header action references unknown component `{action_id}`",
+                        page.id
+                    )));
+                }
+            }
+        }
         check_layout_refs(&page.layout, &component_ids, page.id.as_str())?;
     }
     for nav in &doc.nav {
@@ -362,7 +408,7 @@ fn check_layout_refs(
     page_id: &str,
 ) -> AppResult<()> {
     match node {
-        LayoutNode::Row { children } | LayoutNode::Column { children } => children
+        LayoutNode::Row { children } | LayoutNode::Column { children, .. } => children
             .iter()
             .try_for_each(|c| check_layout_refs(c, component_ids, page_id)),
         LayoutNode::Section { children, .. } => children
@@ -428,6 +474,7 @@ mod tests {
                 id: "p".to_owned(),
                 path: "/p".to_owned(),
                 title: "P".to_owned(),
+                header: None,
                 layout: LayoutNode::Row { children: vec![] },
                 components: vec![
                     Component {
@@ -472,6 +519,7 @@ mod tests {
                 id: "p".to_owned(),
                 path: "/p/:known".to_owned(),
                 title: "P".to_owned(),
+                header: None,
                 layout: LayoutNode::Component {
                     component_id: "c".to_owned(),
                 },
@@ -516,6 +564,7 @@ mod tests {
                 id: "p".to_owned(),
                 path: "/p".to_owned(),
                 title: "P".to_owned(),
+                header: None,
                 layout: LayoutNode::Component {
                     component_id: "c".to_owned(),
                 },

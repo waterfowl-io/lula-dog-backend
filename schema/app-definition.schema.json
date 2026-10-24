@@ -164,9 +164,25 @@
               },
               "type": "array"
             },
+            "flex": {
+              "description": "A flex-grow factor relative to sibling columns in the same row\nthat also set one (both default to `1` otherwise).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "type": {
               "const": "column",
               "type": "string"
+            },
+            "width": {
+              "description": "A fixed CSS width (e.g. `\"320px\"`), for a column that shouldn't\ngrow with its siblings -- a narrow details rail beside a wider\nactivity column, say.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -242,6 +258,17 @@
           },
           "type": "array"
         },
+        "header": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PageHeader"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional subtitle and inline actions rendered on the title row,\ninstead of `title` standing alone. A page that doesn't author one\njust gets the bare `title`."
+        },
         "id": {
           "type": "string"
         },
@@ -262,6 +289,35 @@
         "title",
         "layout"
       ],
+      "type": "object"
+    },
+    "PageHeader": {
+      "properties": {
+        "actions": {
+          "description": "Ids of this page's own `components`, rendered inline on the title\nrow (e.g. a \"New deal\" form's trigger button) instead of in\n`layout`'s normal flow. Each must still be one of the page's\n`components`; it is simply not also placed in `layout`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "subtitle": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueryBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A query whose first row fills `subtitle_template`'s `{field}`\ntokens, e.g. `\"{deal_count} deals across {stage_count} stages\"`."
+        },
+        "subtitle_template": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "QueryBinding": {
