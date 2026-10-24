@@ -218,24 +218,7 @@ fn row_to_json(headers: &csv::StringRecord, record: &csv::StringRecord) -> serde
     serde_json::Value::Object(map)
 }
 
-/// Keyword lists scored against a company name by the cheap filter, taken
-/// from the active target profile (empty when there is none yet).
-#[derive(Debug, Clone, Default)]
-struct ProfileKeywords {
-    include: Vec<String>,
-    industries: Vec<String>,
-    exclude: Vec<String>,
-}
-
-impl From<Option<&TargetProfile>> for ProfileKeywords {
-    fn from(profile: Option<&TargetProfile>) -> Self {
-        profile.map_or_else(Self::default, |p| Self {
-            include: p.include_keywords.0.clone(),
-            industries: p.industries.0.clone(),
-            exclude: p.exclude_keywords.0.clone(),
-        })
-    }
-}
+use super::ProfileKeywords;
 
 enum RowOutcome {
     New { filtered: bool },

@@ -4,6 +4,9 @@
 //! `coverage_log` entry with counts.
 
 pub mod bizapedia;
+pub mod il_sos_llc;
+
+use crate::target_profiles::TargetProfile;
 
 /// Lowercase, trim, collapse internal whitespace. Used to match a CSV header
 /// (or a fixed-width field label) against a configured alias regardless of
@@ -14,6 +17,25 @@ pub fn normalize_header(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Keyword lists scored against a company name by the cheap filter, taken
+/// from the active target profile (empty when there is none yet).
+#[derive(Debug, Clone, Default)]
+pub struct ProfileKeywords {
+    pub include: Vec<String>,
+    pub industries: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+impl From<Option<&TargetProfile>> for ProfileKeywords {
+    fn from(profile: Option<&TargetProfile>) -> Self {
+        profile.map_or_else(Self::default, |p| Self {
+            include: p.include_keywords.0.clone(),
+            industries: p.industries.0.clone(),
+            exclude: p.exclude_keywords.0.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]

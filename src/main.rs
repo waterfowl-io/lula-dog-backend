@@ -6,6 +6,7 @@ use anyhow::bail;
 use lula_dog_backend::bucket::Bucket;
 use lula_dog_backend::config::Config;
 use lula_dog_backend::importers::bizapedia::{self, ColumnMapping};
+use lula_dog_backend::importers::il_sos_llc;
 use lula_dog_backend::{AppState, db, extractor_from_config, router, seed, target_profiles};
 use tracing_subscriber::EnvFilter;
 
@@ -84,8 +85,11 @@ async fn import_cmd(config: Config, args: &[String]) -> anyhow::Result<()> {
     let flags = parse_flags(args.get(1..).unwrap_or_default());
     match args.first().map(String::as_str) {
         Some("bizapedia") => import_bizapedia(config, &flags).await,
-        Some(other) => bail!("unknown import source `{other}`; expected `bizapedia`"),
-        None => bail!("usage: import bizapedia <path.csv> [--mapping <file>]"),
+        Some("il-sos-llc") => import_il_sos_llc(config, &flags).await,
+        Some(other) => {
+            bail!("unknown import source `{other}`; expected `bizapedia` or `il-sos-llc`")
+        }
+        None => bail!("usage: import <bizapedia|il-sos-llc> <path> [--mapping <file>]"),
     }
 }
 
@@ -117,6 +121,30 @@ async fn import_bizapedia(config: Config, flags: &Flags<'_>) -> anyhow::Result<(
         filtered = summary.filtered,
         error = summary.error,
         "bizapedia import complete"
+    );
+    Ok(())
+}
+
+async fn import_il_sos_llc(config: Config, flags: &Flags<'_>) -> anyhow::Result<()> {
+    let Some(&master_path) = flags.positional.first() else {
+        bail!("usage: import il-sos-llc <path to llcallmst.txt>");
+    };
+
+    let pool = db::connect(&config.database_url).await?;
+    let bucket = Bucket::new(&config.bucket_dir);
+    let mut conn = pool.acquire().await?;
+    let profile = target_profiles::first(&mut conn).await?;
+    drop(conn);
+
+    let summary =
+        il_sos_llc::import(&pool, &bucket, Path::new(master_path), profile.as_ref()).await?;
+    tracing::info!(
+        seen = summary.seen,
+        new = summary.new,
+        duplicate = summary.duplicate,
+        filtered = summary.filtered,
+        error = summary.error,
+        "il-sos-llc import complete"
     );
     Ok(())
 }
