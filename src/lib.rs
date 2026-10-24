@@ -3,6 +3,7 @@
 
 pub mod alerts;
 pub mod bucket;
+pub mod classifier;
 pub mod companies;
 pub mod config;
 pub mod coverage;
