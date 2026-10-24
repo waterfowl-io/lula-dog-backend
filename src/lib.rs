@@ -2,6 +2,8 @@
 //! system of record.
 
 pub mod alerts;
+pub mod bucket;
+pub mod companies;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -11,6 +13,7 @@ pub mod opportunities;
 pub mod paste;
 pub mod proposals;
 pub mod seed;
+pub mod target_profiles;
 pub mod tasks;
 pub mod time;
 pub mod timeline;
@@ -75,6 +78,16 @@ pub fn router(state: AppState) -> Router {
         .route("/proposals/{id}/accept", post(proposals::accept))
         .route("/proposals/{id}/reject", post(proposals::reject))
         .route("/alerts/stale", get(alerts::stale))
+        .route(
+            "/target-profiles",
+            get(target_profiles::list_handler).post(target_profiles::create),
+        )
+        .route(
+            "/target-profiles/{id}",
+            get(target_profiles::get)
+                .patch(target_profiles::patch)
+                .delete(target_profiles::delete),
+        )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -114,6 +127,11 @@ pub async fn health(State(state): State<AppState>) -> AppResult<Json<Health>> {
         proposals::accept_all,
         proposals::dismiss_all,
         alerts::stale,
+        target_profiles::list_handler,
+        target_profiles::create,
+        target_profiles::get,
+        target_profiles::patch,
+        target_profiles::delete,
     )
 )]
 pub struct ApiDoc;

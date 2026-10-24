@@ -22,6 +22,9 @@ async fn main() -> anyhow::Result<()> {
         Some("seed") => {
             let pool = db::connect(&config.database_url).await?;
             let summary = seed::run(&pool).await?;
+            let mut conn = pool.acquire().await?;
+            lula_dog_backend::target_profiles::seed_default(&mut conn, config.lead_min_fit_score)
+                .await?;
             tracing::info!(
                 opportunities = summary.opportunities,
                 database = %config.database_url,
