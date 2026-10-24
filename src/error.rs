@@ -15,8 +15,16 @@ pub enum AppError {
     NotFound(&'static str),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    Unauthorized(String),
+    #[error("{0}")]
+    Forbidden(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    /// A server-side invariant was violated (never caused by the request).
+    /// The detail is logged, never returned to the caller.
+    #[error("{0}")]
+    Internal(String),
 }
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -59,8 +67,18 @@ impl IntoResponse for AppError {
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m.clone()),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
             Self::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.clone()),
+            Self::Unauthorized(m) => (StatusCode::UNAUTHORIZED, "unauthorized", m.clone()),
+            Self::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m.clone()),
             Self::Database(e) => {
                 tracing::error!(error = %e, "database error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "internal error".to_owned(),
+                )
+            }
+            Self::Internal(m) => {
+                tracing::error!(error = %m, "internal error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal",
