@@ -1,8 +1,16 @@
-//! `lula-dog-backend [serve|seed]`. `serve` is the default.
+//! `lula-dog-backend [serve|seed|import ...]`. `serve` is the default.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::bail;
+use lula_dog_backend::bucket::Bucket;
 use lula_dog_backend::config::Config;
-use lula_dog_backend::{AppState, db, extractor_from_config, router, seed};
+use lula_dog_backend::importers::bizapedia::{self, ColumnMapping};
+use lula_dog_backend::importers::il_sos_llc;
+use lula_dog_backend::{
+    AppState, classifier_from_config, db, enrichment, extractor_from_config, fetcher_from_config,
+    places_from_config, router, seed, target_profiles,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -16,20 +24,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let command = std::env::args().nth(1);
-    match command.as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
         None | Some("serve") => serve(config).await,
-        Some("seed") => {
-            let pool = db::connect(&config.database_url).await?;
-            let summary = seed::run(&pool).await?;
-            tracing::info!(
-                opportunities = summary.opportunities,
-                database = %config.database_url,
-                "seeded"
-            );
-            Ok(())
+        Some("seed") => seed_cmd(config).await,
+        Some("import") => import_cmd(config, args.get(1..).unwrap_or_default()).await,
+        Some("enrich") => enrich_cmd(config, parse_flags(args.get(1..).unwrap_or_default())).await,
+        Some("classify") => {
+            classify_cmd(config, parse_flags(args.get(1..).unwrap_or_default())).await
         }
-        Some(other) => bail!("unknown command `{other}`; expected `serve` or `seed`"),
+        Some(other) => {
+            bail!("unknown command `{other}`; expected serve, seed, import, enrich or classify")
+        }
     }
 }
 
@@ -45,5 +51,171 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    Ok(())
+}
+
+async fn seed_cmd(config: Config) -> anyhow::Result<()> {
+    let pool = db::connect(&config.database_url).await?;
+    let summary = seed::run(&pool).await?;
+    let mut conn = pool.acquire().await?;
+    target_profiles::seed_default(&mut conn, config.lead_min_fit_score).await?;
+    tracing::info!(
+        opportunities = summary.opportunities,
+        database = %config.database_url,
+        "seeded"
+    );
+    Ok(())
+}
+
+/// Positional arguments and `--flag value` pairs, split from one argument
+/// list. Every `--xxx` token consumes the following token as its value.
+struct Flags<'a> {
+    positional: Vec<&'a str>,
+    named: std::collections::HashMap<&'a str, &'a str>,
+}
+
+fn parse_flags(args: &[String]) -> Flags<'_> {
+    let mut positional = Vec::new();
+    let mut named = std::collections::HashMap::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(flag) = arg.strip_prefix("--") {
+            if let Some(value) = iter.next() {
+                named.insert(flag, value.as_str());
+            }
+        } else {
+            positional.push(arg.as_str());
+        }
+    }
+    Flags { positional, named }
+}
+
+async fn import_cmd(config: Config, args: &[String]) -> anyhow::Result<()> {
+    let flags = parse_flags(args.get(1..).unwrap_or_default());
+    match args.first().map(String::as_str) {
+        Some("bizapedia") => import_bizapedia(config, &flags).await,
+        Some("il-sos-llc") => import_il_sos_llc(config, &flags).await,
+        Some(other) => {
+            bail!("unknown import source `{other}`; expected `bizapedia` or `il-sos-llc`")
+        }
+        None => bail!("usage: import <bizapedia|il-sos-llc> <path> [--mapping <file>]"),
+    }
+}
+
+async fn import_bizapedia(config: Config, flags: &Flags<'_>) -> anyhow::Result<()> {
+    let Some(&csv_path) = flags.positional.first() else {
+        bail!("usage: import bizapedia <path.csv> [--mapping <file>]");
+    };
+    let mapping_path: Option<PathBuf> = flags.named.get("mapping").map(PathBuf::from);
+    let mapping = ColumnMapping::load(mapping_path.as_deref())?;
+
+    let pool = db::connect(&config.database_url).await?;
+    let bucket = Bucket::new(&config.bucket_dir);
+    let mut conn = pool.acquire().await?;
+    let profile = target_profiles::first(&mut conn).await?;
+    drop(conn);
+
+    let summary = bizapedia::import(
+        &pool,
+        &bucket,
+        Path::new(csv_path),
+        &mapping,
+        profile.as_ref(),
+    )
+    .await?;
+    tracing::info!(
+        seen = summary.seen,
+        new = summary.new,
+        duplicate = summary.duplicate,
+        filtered = summary.filtered,
+        error = summary.error,
+        "bizapedia import complete"
+    );
+    Ok(())
+}
+
+async fn import_il_sos_llc(config: Config, flags: &Flags<'_>) -> anyhow::Result<()> {
+    let Some(&master_path) = flags.positional.first() else {
+        bail!("usage: import il-sos-llc <path to llcallmst.txt>");
+    };
+
+    let pool = db::connect(&config.database_url).await?;
+    let bucket = Bucket::new(&config.bucket_dir);
+    let mut conn = pool.acquire().await?;
+    let profile = target_profiles::first(&mut conn).await?;
+    drop(conn);
+
+    let summary =
+        il_sos_llc::import(&pool, &bucket, Path::new(master_path), profile.as_ref()).await?;
+    tracing::info!(
+        seen = summary.seen,
+        new = summary.new,
+        duplicate = summary.duplicate,
+        filtered = summary.filtered,
+        error = summary.error,
+        "il-sos-llc import complete"
+    );
+    Ok(())
+}
+
+const DEFAULT_LIMIT: i64 = 50;
+
+fn limit_flag(flags: &Flags<'_>) -> anyhow::Result<i64> {
+    flags.named.get("limit").map_or_else(
+        || Ok(DEFAULT_LIMIT),
+        |v| {
+            v.parse()
+                .map_err(|e| anyhow::anyhow!("--limit is invalid: {e}"))
+        },
+    )
+}
+
+async fn enrich_cmd(config: Config, flags: Flags<'_>) -> anyhow::Result<()> {
+    let limit = limit_flag(&flags)?;
+    let pool = db::connect(&config.database_url).await?;
+    let bucket = Bucket::new(&config.bucket_dir);
+    let places = places_from_config(&config.places)?;
+    let fetcher = fetcher_from_config(config.crawler, &config.crawl_limits)?;
+
+    let summary = enrichment::run_enrich(
+        &pool,
+        &bucket,
+        &*places,
+        &*fetcher,
+        config.crawl_limits,
+        limit,
+    )
+    .await?;
+    tracing::info!(
+        places_attempted = summary.places.attempted,
+        places_success = summary.places.success,
+        places_error = summary.places.error,
+        crawl_attempted = summary.crawl.attempted,
+        crawl_success = summary.crawl.success,
+        crawl_error = summary.crawl.error,
+        "enrich complete"
+    );
+    Ok(())
+}
+
+async fn classify_cmd(config: Config, flags: Flags<'_>) -> anyhow::Result<()> {
+    let limit = limit_flag(&flags)?;
+    let pool = db::connect(&config.database_url).await?;
+    let classifier = classifier_from_config(&config.classifier)?;
+    let mut conn = pool.acquire().await?;
+    let Some(profile) = target_profiles::first(&mut conn).await? else {
+        bail!(
+            "classify requires a target profile; create one with POST /target-profiles or `cargo run -- seed` first"
+        );
+    };
+    drop(conn);
+
+    let summary = enrichment::run_classify(&pool, &*classifier, &profile, limit).await?;
+    tracing::info!(
+        attempted = summary.attempted,
+        success = summary.success,
+        error = summary.error,
+        "classify complete"
+    );
     Ok(())
 }
