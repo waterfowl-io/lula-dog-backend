@@ -121,3 +121,36 @@ pub async fn create(
     .fetch_one(pool)
     .await?)
 }
+
+/// Insert or update by `(workspace_id, key)`. Used by `cargo run -- seed`
+/// so re-running it against a workspace that already has these queries
+/// converges them to the current definitions instead of only creating
+/// whatever's missing.
+pub async fn upsert(
+    pool: &ControlPool,
+    workspace_id: Uuid,
+    new: NewSavedQuery,
+) -> AppResult<SavedQuery> {
+    if new.sql_text.trim().is_empty() {
+        return Err(AppError::BadRequest("sql_text cannot be empty".to_owned()));
+    }
+    Ok(sqlx::query_as::<_, SavedQuery>(
+        "INSERT INTO saved_queries (workspace_id, key, name, description, sql_text, params)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (workspace_id, key) DO UPDATE
+         SET name = EXCLUDED.name,
+             description = EXCLUDED.description,
+             sql_text = EXCLUDED.sql_text,
+             params = EXCLUDED.params,
+             updated_at = now()
+         RETURNING *",
+    )
+    .bind(workspace_id)
+    .bind(new.key)
+    .bind(new.name)
+    .bind(new.description)
+    .bind(new.sql_text)
+    .bind(new.params)
+    .fetch_one(pool)
+    .await?)
+}

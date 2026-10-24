@@ -16,13 +16,16 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::app_definition::AppDefinitionDoc;
+use crate::companies::{self, NewCompany};
 use crate::config;
 use crate::control::app_definitions;
 use crate::control::saved_queries::{self, NewSavedQuery};
 use crate::control::workspaces;
 use crate::control::{ControlPool, profiles};
 use crate::extractor::{Extractor, StubExtractor};
+use crate::leads;
 use crate::opportunities::{self, NewOpportunity, Stage};
+use crate::target_profiles;
 use crate::{app_definition, paste, tasks};
 
 const DEV_USER_EMAIL: &str = "jack@lula.dog.example";
@@ -30,6 +33,7 @@ const JACKS_WORKSPACE_NAME: &str = "Jack's Packaging";
 
 pub struct SeedSummary {
     pub opportunities: usize,
+    pub leads: usize,
 }
 
 fn days_ago(days: i64) -> DateTime<Utc> {
@@ -60,7 +64,7 @@ fn opp(company: &str, name: &str, email: &str, stage: Stage) -> NewOpportunity {
     clippy::too_many_lines,
     reason = "seed data reads best as one top-to-bottom list of deals"
 )]
-pub async fn run(pool: &SqlitePool) -> anyhow::Result<SeedSummary> {
+pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<SeedSummary> {
     let mut conn = pool.acquire().await?;
     let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM opportunities")
         .fetch_one(&mut *conn)
@@ -71,6 +75,10 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<SeedSummary> {
              (delete the database file to start over)"
         );
     }
+    target_profiles::seed_default(&mut conn, lead_min_fit_score).await?;
+    let profile = target_profiles::first(&mut conn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("just seeded a default target profile"))?;
     let extractor: Arc<dyn Extractor> = Arc::new(StubExtractor);
     let mut count = 0;
 
@@ -285,8 +293,69 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<SeedSummary> {
     .await?;
     count += 1;
 
+    // The lead queue: a handful of clearly-fake companies (`.example`
+    // domains, same convention as the opportunities above) queued as lead
+    // candidates so `/leads` isn't empty out of the box.
+    let lead_defs: &[(&str, &str, &str, i64, &str)] = &[
+        (
+            "Bluebird Coffee Roasters",
+            "bluebirdcoffee.example",
+            "Food & beverage",
+            86,
+            "Ships physical goods, similar size to existing roaster accounts, no packaging vendor on file.",
+        ),
+        (
+            "Fernhill Candle Co.",
+            "fernhillcandle.example",
+            "Manufacturing",
+            78,
+            "Growing DTC brand, currently hand-packing -- good fit for retail boxes.",
+        ),
+        (
+            "Northside Print Shop",
+            "northsideprint.example",
+            "Distribution",
+            61,
+            "Ships physical goods but low order volume so far; worth a qualifying call.",
+        ),
+        (
+            "Harbor & Oak Furniture",
+            "harborandoak.example",
+            "Manufacturing",
+            54,
+            "Bulk/industrial packaging, lower margin fit, but a large potential volume.",
+        ),
+    ];
+    let mut lead_count = 0;
+    for (name, domain, category, fit_score, fit_reason) in lead_defs {
+        let company = companies::upsert(
+            &mut conn,
+            NewCompany {
+                name: (*name).to_owned(),
+                jurisdiction: "IL".to_owned(),
+                website: Some(format!("https://{domain}")),
+                category: Some((*category).to_owned()),
+                ..NewCompany::default()
+            },
+        )
+        .await?;
+        if leads::queue_candidate(
+            &mut conn,
+            company.id,
+            profile.id,
+            *fit_score,
+            Some(fit_reason),
+        )
+        .await?
+        .is_some()
+        {
+            lead_count += 1;
+        }
+    }
+
     Ok(SeedSummary {
         opportunities: count,
+        leads: lead_count,
     })
 }
 
@@ -305,28 +374,35 @@ pub async fn ensure_dev_workspace(control: &ControlPool) -> anyhow::Result<Uuid>
     Ok(workspace.id)
 }
 
-/// Create the saved queries and the "Sales" app definition for a workspace,
-/// if they don't already exist.
+/// Create (or converge) the saved queries and the "Sales" app definition
+/// for a workspace. Safe to call repeatedly against a workspace that
+/// already has them: saved queries are upserted by key, and the sales app
+/// gets a new published version whenever `sales_app_definition()` differs
+/// from what's currently published -- so re-running `cargo run -- seed`
+/// against an existing dev database picks up schema/definition changes
+/// without touching the workspace's SQLite data.
 pub async fn seed_control_plane(control: &ControlPool, workspace_id: Uuid) -> anyhow::Result<()> {
     for query in sales_saved_queries() {
-        if saved_queries::find_by_key(control, workspace_id, &query.key)
-            .await?
-            .is_none()
-        {
-            saved_queries::create(control, workspace_id, query).await?;
-        }
+        saved_queries::upsert(control, workspace_id, query).await?;
     }
-    if app_definitions::find_by_key(control, workspace_id, "sales")
-        .await?
-        .is_none()
-    {
-        let doc = sales_app_definition();
-        app_definition::validate(control, workspace_id, &doc).await?;
-        let app = app_definitions::create(control, workspace_id, "sales", "Sales").await?;
-        let version =
-            app_definitions::create_version(control, app.id, serde_json::to_value(&doc)?, None)
-                .await?;
-        app_definitions::publish(control, workspace_id, app.id, version.id).await?;
+    let doc = sales_app_definition();
+    app_definition::validate(control, workspace_id, &doc).await?;
+    let generated = serde_json::to_value(&doc)?;
+    match app_definitions::find_by_key(control, workspace_id, "sales").await? {
+        None => {
+            let app = app_definitions::create(control, workspace_id, "sales", "Sales").await?;
+            let version = app_definitions::create_version(control, app.id, generated, None).await?;
+            app_definitions::publish(control, workspace_id, app.id, version.id).await?;
+        }
+        Some(app) => {
+            let (_, published) =
+                app_definitions::fetch_published_or_latest(control, workspace_id, app.id).await?;
+            if published.definition != generated {
+                let version =
+                    app_definitions::create_version(control, app.id, generated, None).await?;
+                app_definitions::publish(control, workspace_id, app.id, version.id).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -343,6 +419,10 @@ const STALE_DEALS_INNER_SQL: &str = "\
                             AND t.due_at IS NOT NULL AND date(t.due_at) < date('now')))) AS stale \
     FROM opportunities o";
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "a literal list of saved queries reads best as one top-to-bottom vec"
+)]
 fn sales_saved_queries() -> Vec<NewSavedQuery> {
     let no_params = json!([]);
     let opportunity_id_param = json!([{"name": "opportunity_id", "type": "number"}]);
@@ -350,10 +430,56 @@ fn sales_saved_queries() -> Vec<NewSavedQuery> {
         NewSavedQuery {
             key: "pipeline_by_stage".to_owned(),
             name: "Pipeline by stage".to_owned(),
-            description: Some("Open deals grouped by stage, for the kanban board.".to_owned()),
-            sql_text: "SELECT id, company, stage, value_cents, next_step, last_touch_at \
-                       FROM opportunities WHERE stage NOT IN ('won', 'lost') \
-                       ORDER BY stage, updated_at DESC"
+            description: Some(
+                "Every deal grouped by stage, for the kanban board, with each card's open \
+                 task count, staleness and pending-suggestion count."
+                    .to_owned(),
+            ),
+            sql_text: "SELECT o.id, o.company, o.stage, o.value_cents, o.next_step, \
+                       o.last_touch_at, \
+                       (SELECT COUNT(*) FROM tasks t WHERE t.opportunity_id = o.id \
+                        AND t.done = 0) AS open_task_count, \
+                       (o.stage NOT IN ('won', 'lost') \
+                        AND (COALESCE(o.last_touch_at, o.created_at) < datetime('now', '-14 days') \
+                             OR EXISTS (SELECT 1 FROM tasks t WHERE t.opportunity_id = o.id \
+                                        AND t.done = 0 AND t.due_at IS NOT NULL \
+                                        AND date(t.due_at) < date('now')))) AS stale, \
+                       (SELECT COUNT(*) FROM field_changes fc WHERE fc.opportunity_id = o.id \
+                        AND fc.status = 'proposed') AS pending_proposal_count \
+                       FROM opportunities o ORDER BY o.stage, o.updated_at DESC"
+                .to_owned(),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "pipeline_open_value".to_owned(),
+            name: "Open pipeline value".to_owned(),
+            description: Some("Total value and count of deals not yet won or lost.".to_owned()),
+            sql_text: "SELECT COALESCE(SUM(value_cents), 0) AS value, COUNT(*) AS deal_count \
+                       FROM opportunities WHERE stage NOT IN ('won', 'lost')"
+                .to_owned(),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "pipeline_won_this_month".to_owned(),
+            name: "Won this month".to_owned(),
+            description: Some(
+                "Total value and count of deals won since the start of this month.".to_owned(),
+            ),
+            sql_text: "SELECT COALESCE(SUM(value_cents), 0) AS value, COUNT(*) AS deal_count \
+                       FROM opportunities \
+                       WHERE stage = 'won' AND updated_at >= date('now', 'start of month')"
+                .to_owned(),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "pipeline_suggestions_waiting".to_owned(),
+            name: "Suggestions waiting".to_owned(),
+            description: Some(
+                "Count of pending field-change proposals, and how many deals they're on."
+                    .to_owned(),
+            ),
+            sql_text: "SELECT COUNT(*) AS value, COUNT(DISTINCT opportunity_id) AS deal_count \
+                       FROM field_changes WHERE status = 'proposed'"
                 .to_owned(),
             params: no_params.clone(),
         },
@@ -434,7 +560,7 @@ fn sales_saved_queries() -> Vec<NewSavedQuery> {
             name: "Lead queue".to_owned(),
             description: Some("New (or un-snoozed) leads, highest fit score first.".to_owned()),
             sql_text: "SELECT lc.id, lc.fit_score, lc.fit_reason, lc.status, lc.snoozed_until, \
-                       c.name AS company_name, c.website, c.phone \
+                       c.name AS company_name, c.website, c.phone, c.category \
                        FROM lead_candidates lc JOIN companies c ON c.id = lc.company_id \
                        WHERE lc.status = 'new' \
                           OR (lc.status = 'snoozed' \
@@ -487,6 +613,16 @@ fn props(entries: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde
         .collect()
 }
 
+/// A component's named `actions` map, e.g. `{"accept": ..., "reject": ...}`.
+fn actions_map(
+    entries: Vec<(&str, app_definition::ActionBinding)>,
+) -> std::collections::BTreeMap<String, app_definition::ActionBinding> {
+    entries
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect()
+}
+
 /// The dashboard Jack gets from `cargo run -- seed`: a pipeline kanban by
 /// stage, a deals table, a stale-deals metric card and alert list, a
 /// pipeline-value chart, a deal detail page (fields, timeline, a paste
@@ -500,8 +636,34 @@ fn props(entries: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde
 pub fn sales_app_definition() -> AppDefinitionDoc {
     use app_definition::{Component, ComponentKind, LayoutNode, Page};
 
+    let badge_colors = json!({
+        "lead": {"bg": "#F8F1E9", "text": "#6E6966", "dot": "#968D86"},
+        "qualified": {"bg": "#E3EEFB", "text": "#2A5DA6", "dot": "#3F7FD6"},
+        "proposal": {"bg": "#FCF0D6", "text": "#8A5E0F", "dot": "#E5A228"},
+        "won": {"bg": "#E3F3EA", "text": "#1F7650", "dot": "#2E9E6A"},
+        "lost": {"bg": "#F8F1E9", "text": "#6E6966", "dot": "#968D86"},
+    });
+
     AppDefinitionDoc {
         version: 1,
+        brand: Some(app_definition::Brand {
+            title: "Jack's Sales".to_owned(),
+            mark: Some("lula".to_owned()),
+            chat: Some(app_definition::ChatBrand {
+                status: Some("Building Jack's Sales".to_owned()),
+                placeholder: Some("Ask Lula to change this app…".to_owned()),
+            }),
+        }),
+        nav: vec![
+            app_definition::NavItem {
+                label: "Pipeline".to_owned(),
+                path: "/".to_owned(),
+            },
+            app_definition::NavItem {
+                label: "Leads".to_owned(),
+                path: "/leads".to_owned(),
+            },
+        ],
         pages: vec![
             Page {
                 id: "pipeline".to_owned(),
@@ -509,6 +671,27 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                 title: "Pipeline".to_owned(),
                 layout: LayoutNode::Column {
                     children: vec![
+                        LayoutNode::Row {
+                            children: vec![LayoutNode::Component {
+                                component_id: "new_deal_form".to_owned(),
+                            }],
+                        },
+                        LayoutNode::Row {
+                            children: vec![
+                                LayoutNode::Component {
+                                    component_id: "metric_open_value".to_owned(),
+                                },
+                                LayoutNode::Component {
+                                    component_id: "metric_won_this_month".to_owned(),
+                                },
+                                LayoutNode::Component {
+                                    component_id: "stale_metric".to_owned(),
+                                },
+                                LayoutNode::Component {
+                                    component_id: "metric_suggestions_waiting".to_owned(),
+                                },
+                            ],
+                        },
                         LayoutNode::Component {
                             component_id: "pipeline_kanban".to_owned(),
                         },
@@ -518,32 +701,133 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                                     component_id: "deals_table".to_owned(),
                                 },
                                 LayoutNode::Column {
-                                    children: vec![
-                                        LayoutNode::Component {
-                                            component_id: "stale_metric".to_owned(),
-                                        },
-                                        LayoutNode::Component {
-                                            component_id: "stale_alerts".to_owned(),
-                                        },
-                                    ],
+                                    children: vec![LayoutNode::Component {
+                                        component_id: "stale_alerts".to_owned(),
+                                    }],
                                 },
                             ],
                         },
-                        LayoutNode::Component {
-                            component_id: "pipeline_value_chart".to_owned(),
+                        LayoutNode::Section {
+                            title: Some("Pipeline value by stage".to_owned()),
+                            children: vec![LayoutNode::Component {
+                                component_id: "pipeline_value_chart".to_owned(),
+                            }],
                         },
                     ],
                 },
                 components: vec![
+                    Component {
+                        id: "new_deal_form".to_owned(),
+                        kind: ComponentKind::Form,
+                        title: Some("New deal".to_owned()),
+                        query: None,
+                        action: Some(action_binding("opportunity.create")),
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("trigger_label", json!("New deal")),
+                            ("button_label", json!("Add deal")),
+                            (
+                                "fields",
+                                json!([
+                                    {"name": "company", "type": "text", "label": "Company", "required": true},
+                                    {"name": "contact_name", "type": "text", "label": "Contact"},
+                                    {"name": "contact_email", "type": "text", "label": "Email"},
+                                    {"name": "value_cents", "type": "currency", "label": "Value"},
+                                    {"name": "next_step", "type": "text", "label": "Next step"},
+                                ]),
+                            ),
+                        ]),
+                    },
+                    Component {
+                        id: "metric_open_value".to_owned(),
+                        kind: ComponentKind::MetricCard,
+                        title: Some("Open pipeline".to_owned()),
+                        query: Some(query_binding("pipeline_open_value")),
+                        action: None,
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("value_field", json!("value")),
+                            ("format", json!("currency_cents")),
+                            ("caption_field", json!("deal_count")),
+                            ("caption_suffix", json!(" deals")),
+                        ]),
+                    },
+                    Component {
+                        id: "metric_won_this_month".to_owned(),
+                        kind: ComponentKind::MetricCard,
+                        title: Some("Won this month".to_owned()),
+                        query: Some(query_binding("pipeline_won_this_month")),
+                        action: None,
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("value_field", json!("value")),
+                            ("format", json!("currency_cents")),
+                            ("caption_field", json!("deal_count")),
+                            ("caption_suffix", json!(" deals")),
+                        ]),
+                    },
+                    Component {
+                        id: "stale_metric".to_owned(),
+                        kind: ComponentKind::MetricCard,
+                        title: Some("Needs a touch".to_owned()),
+                        query: Some(query_binding("stale_deals_count")),
+                        action: None,
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("value_field", json!("value")),
+                            ("caption", json!("no touch in 14+ days")),
+                            ("accent", json!(true)),
+                        ]),
+                    },
+                    Component {
+                        id: "metric_suggestions_waiting".to_owned(),
+                        kind: ComponentKind::MetricCard,
+                        title: Some("Suggestions waiting".to_owned()),
+                        query: Some(query_binding("pipeline_suggestions_waiting")),
+                        action: None,
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("value_field", json!("value")),
+                            ("caption_field", json!("deal_count")),
+                            ("caption_suffix", json!(" deal(s)")),
+                            ("accent", json!(true)),
+                        ]),
+                    },
                     Component {
                         id: "pipeline_kanban".to_owned(),
                         kind: ComponentKind::Kanban,
                         title: Some("Pipeline".to_owned()),
                         query: Some(query_binding("pipeline_by_stage")),
                         action: Some(action_binding("opportunity.update_stage")),
+                        actions: actions_map(vec![]),
                         props: props(&[
                             ("group_field", json!("stage")),
                             ("card_title_field", json!("company")),
+                            ("add_label", json!("Add deal")),
+                            (
+                                "columns",
+                                json!([
+                                    {"key": "lead", "label": "Lead", "color": "#968D86", "addable": true},
+                                    {"key": "qualified", "label": "Qualified", "color": "#3F7FD6"},
+                                    {"key": "proposal", "label": "Proposal", "color": "#E5A228"},
+                                    {"key": "won", "label": "Won", "color": "#2E9E6A"},
+                                    {"key": "lost", "label": "Lost", "color": "#C2B8AE"},
+                                ]),
+                            ),
+                            (
+                                "card",
+                                json!({
+                                    "title_field": "company",
+                                    "value_field": "value_cents",
+                                    "value_format": "currency_cents",
+                                    "next_step_field": "next_step",
+                                    "age_field": "last_touch_at",
+                                    "open_tasks_field": "open_task_count",
+                                    "stale_field": "stale",
+                                    "suggestions_field": "pending_proposal_count",
+                                    "link": {"page": "deal_detail", "param": "opportunity_id", "param_field": "id"},
+                                }),
+                            ),
                         ]),
                     },
                     Component {
@@ -552,15 +836,8 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                         title: Some("Deals".to_owned()),
                         query: Some(query_binding("deals_table")),
                         action: None,
+                        actions: actions_map(vec![]),
                         props: serde_json::Map::new(),
-                    },
-                    Component {
-                        id: "stale_metric".to_owned(),
-                        kind: ComponentKind::MetricCard,
-                        title: Some("Stale deals".to_owned()),
-                        query: Some(query_binding("stale_deals_count")),
-                        action: None,
-                        props: props(&[("value_field", json!("value"))]),
                     },
                     Component {
                         id: "stale_alerts".to_owned(),
@@ -568,14 +845,16 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                         title: Some("Needs attention".to_owned()),
                         query: Some(query_binding("stale_deals")),
                         action: None,
+                        actions: actions_map(vec![]),
                         props: props(&[("item_title_field", json!("company"))]),
                     },
                     Component {
                         id: "pipeline_value_chart".to_owned(),
                         kind: ComponentKind::Chart,
-                        title: Some("Pipeline value by stage".to_owned()),
+                        title: None,
                         query: Some(query_binding("pipeline_value_by_stage")),
                         action: None,
+                        actions: actions_map(vec![]),
                         props: props(&[
                             ("chart_type", json!("bar")),
                             ("encoding", json!({"x": "stage", "y": "total_value_cents"})),
@@ -592,17 +871,32 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                         LayoutNode::Component {
                             component_id: "deal_detail_view".to_owned(),
                         },
-                        LayoutNode::Component {
-                            component_id: "deal_timeline".to_owned(),
-                        },
-                        LayoutNode::Component {
-                            component_id: "paste_form".to_owned(),
-                        },
-                        LayoutNode::Component {
-                            component_id: "deal_proposals".to_owned(),
-                        },
-                        LayoutNode::Component {
-                            component_id: "deal_tasks".to_owned(),
+                        LayoutNode::Row {
+                            children: vec![
+                                LayoutNode::Column {
+                                    children: vec![
+                                        LayoutNode::Component {
+                                            component_id: "deal_details_panel".to_owned(),
+                                        },
+                                        LayoutNode::Component {
+                                            component_id: "deal_tasks".to_owned(),
+                                        },
+                                    ],
+                                },
+                                LayoutNode::Column {
+                                    children: vec![
+                                        LayoutNode::Component {
+                                            component_id: "paste_form".to_owned(),
+                                        },
+                                        LayoutNode::Component {
+                                            component_id: "deal_proposals".to_owned(),
+                                        },
+                                        LayoutNode::Component {
+                                            component_id: "deal_timeline".to_owned(),
+                                        },
+                                    ],
+                                },
+                            ],
                         },
                     ],
                 },
@@ -610,24 +904,64 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                     Component {
                         id: "deal_detail_view".to_owned(),
                         kind: ComponentKind::DetailView,
-                        title: Some("Deal".to_owned()),
+                        title: None,
                         query: Some(query_binding_with(
                             "deal_detail",
                             &[("opportunity_id", "$route.opportunity_id")],
                         )),
                         action: None,
-                        props: props(&[(
-                            "fields",
-                            json!([
-                                "company",
-                                "contact_name",
-                                "contact_email",
-                                "value_cents",
-                                "stage",
-                                "next_step",
-                                "last_touch_at"
-                            ]),
-                        )]),
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("display", json!("header")),
+                            ("back_link", json!({"label": "Pipeline", "path": "/"})),
+                            ("title_field", json!("company")),
+                            ("badge_field", json!("stage")),
+                            ("badge_format", json!("stage_pill")),
+                            ("badge_colors", badge_colors),
+                            (
+                                "meta",
+                                json!([
+                                    {"icon": "user", "field": "contact_name"},
+                                    {"icon": "clock", "field": "last_touch_at", "format": "relative_date", "prefix": "Last touch "},
+                                ]),
+                            ),
+                            (
+                                "actions",
+                                json!([
+                                    {
+                                        "label": "Move to Won",
+                                        "icon": "check",
+                                        "variant": "primary",
+                                        "action": {"action": "opportunity.update_stage", "params": {"stage": "won"}},
+                                    },
+                                ]),
+                            ),
+                        ]),
+                    },
+                    Component {
+                        id: "deal_details_panel".to_owned(),
+                        kind: ComponentKind::DetailView,
+                        title: Some("Details".to_owned()),
+                        query: Some(query_binding_with(
+                            "deal_detail",
+                            &[("opportunity_id", "$route.opportunity_id")],
+                        )),
+                        action: None,
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("display", json!("panel")),
+                            (
+                                "fields",
+                                json!([
+                                    {"key": "value_cents", "label": "Value", "format": "currency_cents"},
+                                    {"key": "stage", "label": "Stage", "format": "stage_pill"},
+                                    {"key": "next_step", "label": "Next step"},
+                                    {"key": "contact_name", "label": "Contact"},
+                                    {"key": "contact_email", "label": "Email"},
+                                    {"key": "last_touch_at", "label": "Last touch", "format": "relative_date"},
+                                ]),
+                            ),
+                        ]),
                     },
                     Component {
                         id: "deal_timeline".to_owned(),
@@ -638,7 +972,14 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                             &[("opportunity_id", "$route.opportunity_id")],
                         )),
                         action: None,
-                        props: props(&[("item_title_field", json!("summary"))]),
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("variant", json!("timeline")),
+                            (
+                                "item",
+                                json!({"raw_field": "raw_text", "summary_field": "summary", "date_field": "occurred_at"}),
+                            ),
+                        ]),
                     },
                     Component {
                         id: "paste_form".to_owned(),
@@ -649,49 +990,105 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                             "paste.submit",
                             &[("opportunity_id", "$route.opportunity_id")],
                         )),
-                        props: props(&[("fields", json!([{"name": "text", "type": "textarea"}]))]),
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("fields", json!([{"name": "text", "type": "textarea"}])),
+                            (
+                                "placeholder",
+                                json!("Paste an email thread, call notes, or Slack message…"),
+                            ),
+                            ("button_label", json!("Add to deal")),
+                        ]),
                     },
                     Component {
                         id: "deal_proposals".to_owned(),
                         kind: ComponentKind::List,
-                        title: Some("Proposed changes".to_owned()),
+                        title: Some("Lula suggests {count} changes".to_owned()),
                         query: Some(query_binding_with(
                             "deal_proposals",
                             &[("opportunity_id", "$route.opportunity_id")],
                         )),
-                        action: Some(action_binding("proposal.accept")),
-                        props: props(&[("item_title_field", json!("field"))]),
+                        action: None,
+                        actions: actions_map(vec![
+                            ("accept", action_binding("proposal.accept")),
+                            ("reject", action_binding("proposal.reject")),
+                        ]),
+                        props: props(&[
+                            ("variant", json!("proposals")),
+                            ("hidden_when_empty", json!(true)),
+                            (
+                                "item",
+                                json!({"field_field": "field", "old_field": "old_value", "new_field": "new_value"}),
+                            ),
+                        ]),
                     },
                     Component {
                         id: "deal_tasks".to_owned(),
                         kind: ComponentKind::List,
-                        title: Some("Tasks".to_owned()),
+                        title: Some("To-dos".to_owned()),
                         query: Some(query_binding_with(
                             "deal_tasks",
                             &[("opportunity_id", "$route.opportunity_id")],
                         )),
-                        action: Some(action_binding("task.complete")),
-                        props: props(&[("item_title_field", json!("title"))]),
+                        action: None,
+                        actions: actions_map(vec![
+                            ("complete", action_binding("task.complete")),
+                            (
+                                "create",
+                                action_binding_with(
+                                    "task.create",
+                                    &[("opportunity_id", "$route.opportunity_id")],
+                                ),
+                            ),
+                        ]),
+                        props: props(&[
+                            ("variant", json!("tasks")),
+                            ("add_label", json!("Add")),
+                            (
+                                "item",
+                                json!({
+                                    "title_field": "title",
+                                    "done_field": "done",
+                                    "due_field": "due_at",
+                                    "source_field": "source_entry_id",
+                                }),
+                            ),
+                        ]),
                     },
                 ],
             },
             Page {
                 id: "lead_queue".to_owned(),
                 path: "/leads".to_owned(),
-                title: "Lead queue".to_owned(),
-                layout: LayoutNode::Component {
-                    component_id: "lead_queue_table".to_owned(),
+                title: "Leads".to_owned(),
+                layout: LayoutNode::Column {
+                    children: vec![LayoutNode::Component {
+                        component_id: "lead_queue_list".to_owned(),
+                    }],
                 },
                 components: vec![Component {
-                    id: "lead_queue_table".to_owned(),
-                    kind: ComponentKind::Table,
+                    id: "lead_queue_list".to_owned(),
+                    kind: ComponentKind::List,
                     title: Some("Lead queue".to_owned()),
                     query: Some(query_binding("lead_queue")),
-                    action: Some(action_binding("lead.accept")),
-                    props: props(&[(
-                        "columns",
-                        json!(["company_name", "fit_score", "website", "phone"]),
-                    )]),
+                    action: None,
+                    actions: actions_map(vec![
+                        ("accept", action_binding("lead.accept")),
+                        ("reject", action_binding("lead.reject")),
+                        ("snooze", action_binding("lead.snooze")),
+                    ]),
+                    props: props(&[
+                        ("variant", json!("leads")),
+                        (
+                            "item",
+                            json!({
+                                "title_field": "company_name",
+                                "score_field": "fit_score",
+                                "reason_field": "fit_reason",
+                                "category_field": "category",
+                            }),
+                        ),
+                    ]),
                 }],
             },
         ],

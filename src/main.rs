@@ -138,12 +138,10 @@ async fn seed_cmd(config: Config, flags: Flags<'_>) -> anyhow::Result<()> {
     };
 
     let pool = workspace_pool(&config, workspace_id).await?;
-    let summary = seed::run(&pool).await?;
-    let mut conn = pool.acquire().await?;
-    target_profiles::seed_default(&mut conn, config.lead_min_fit_score).await?;
-    drop(conn);
+    let summary = seed::run(&pool, config.lead_min_fit_score).await?;
     tracing::info!(
         opportunities = summary.opportunities,
+        leads = summary.leads,
         %workspace_id,
         "seeded sqlite data"
     );
