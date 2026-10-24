@@ -10,6 +10,13 @@ thread or call notes onto a deal; the backend saves it, has an AI extractor
 pull out contacts, amounts, stage, next steps, dates and follow-up tasks, and
 turns that into proposals he can accept or reject.
 
+The second piece is structured lead generation: instead of Jack re-asking an
+AI chat for leads and getting the same companies back, the backend imports
+business filings, dedupes and filters them, enriches and classifies the
+survivors, and queues the good ones for Jack to accept straight into the
+tracker above. See [`docs/lead-gen.md`](docs/lead-gen.md) for the research,
+the pipeline and what's still open.
+
 ## Run locally
 
 Needs a Rust toolchain (stable, edition 2024). SQLite is bundled; nothing else
@@ -32,9 +39,18 @@ Copy `.env.example` to `.env` to change anything. All variables are optional:
 | `BIND_ADDR` | `127.0.0.1:3000` | Listen address |
 | `RUST_LOG` | `info` | Log filter |
 | `EXTRACTOR` | `stub` | `stub` or `grok` |
-| `XAI_API_KEY` | | Required when `EXTRACTOR=grok` |
-| `XAI_MODEL` | | Required when `EXTRACTOR=grok` |
+| `XAI_API_KEY` | | Required when `EXTRACTOR=grok` or `CLASSIFIER=grok` |
+| `XAI_MODEL` | | Required when `EXTRACTOR=grok` or `CLASSIFIER=grok` |
 | `XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API root |
+| `BUCKET_DIR` | `data/bucket` | Local stand-in for the object store; raw source files and crawled pages |
+| `PLACES` | `stub` | `stub` or `google`, the website-lookup backend |
+| `GOOGLE_PLACES_API_KEY` | | Required when `PLACES=google` |
+| `CRAWLER` | `stub` | `stub` or `http`, the site-crawl backend |
+| `CRAWL_MAX_PAGES` | `4` | Pages fetched per company, home page included |
+| `CRAWL_TIMEOUT_SECS` | `10` | Per-request timeout for `CRAWLER=http` |
+| `CRAWL_MAX_BYTES` | `1000000` | Response size cap for `CRAWLER=http` |
+| `CLASSIFIER` | `stub` | `stub` or `grok`, the lead-scoring backend |
+| `LEAD_MIN_FIT_SCORE` | `50` | `target_profiles.min_fit_score` for the default profile seeded by `seed` |
 
 ## Seed
 
@@ -50,6 +66,9 @@ overdue task). Dates are relative to now, so the data stays realistic whenever
 you seed. Timeline entries go through the real paste flow with the stub
 extractor. It refuses to run on a non-empty database; delete `lula.db` to start
 over.
+
+It also seeds Jack's default lead-gen target profile (Illinois, packaging-
+buying industries), if none exists yet — see [Lead generation](#lead-generation).
 
 ## Test
 
@@ -89,6 +108,12 @@ document is served at `GET /openapi.json`.
 | POST | `/proposals/:id/reject` | Reject a proposal |
 | POST | `/opportunities/:id/proposals/accept-all` | Accept every pending proposal |
 | POST | `/opportunities/:id/proposals/dismiss-all` | Reject every pending proposal |
+| GET, POST | `/target-profiles` | List / create a lead-gen target profile |
+| GET, PATCH, DELETE | `/target-profiles/:id` | |
+| GET | `/leads?status=&min_score=&industry=&profile_id=&limit=&offset=` | Lead queue; `status` defaults to `new`, sorted by fit score descending |
+| POST | `/leads/:id/accept` | Create a step-1 opportunity from a lead |
+| POST | `/leads/:id/reject` | `{reason}` |
+| POST | `/leads/:id/snooze` | `{until}` |
 
 **Stages** are `lead`, `qualified`, `proposal`, `won`, `lost`, enforced by the
 API and by a `CHECK` constraint.
@@ -136,14 +161,55 @@ are written once.
 Extractor output is treated as untrusted: anything that does not validate (an
 unknown stage, a malformed email, an unparseable date) is dropped.
 
+## Lead generation
+
+Full research and plan: [`docs/lead-gen.md`](docs/lead-gen.md). Short version:
+
+```sh
+cargo run -- seed                                        # Jack's default target profile
+cargo run -- import bizapedia <path.csv> [--mapping <file>]
+cargo run -- import il-sos-llc <path to llcallmst.txt>    # llcallnam.txt required alongside
+cargo run -- enrich [--limit N]                           # Places lookup, then crawl
+cargo run -- classify [--limit N]                         # score + queue leads
+```
+
+Importers archive the raw file unchanged in the bucket (`BUCKET_DIR`,
+default `data/bucket`, under `sources/<source>/<date>/<file>`), parse it,
+dedupe/merge into `companies` (by normalized domain, else by jurisdiction +
+state file number — never duplicated either way), record provenance in
+`company_sources`, run a network-free cheap filter (drops
+inactive/dissolved entities and registered-agent/holding-company shells,
+scores the rest against the target profile's keywords), and leave a
+`coverage_log` row with counts. `enrich` looks up a website (Places) and
+crawls a few pages (home plus about/products/contact, text only, respecting
+`robots.txt` and a size cap); `classify` scores fit with an AI classifier
+and queues anything at or above the profile's `min_fit_score` as a lead.
+Every step only processes companies that don't already have a
+`company_enrichments` row of that kind, so re-running any command is safe
+and only does new work. `PLACES`, `CRAWLER` and `CLASSIFIER` all default to
+deterministic stubs, so the whole pipeline runs with no network and no key.
+
+`GET /leads` lists the queue (highest fit score first); accepting one
+creates a step-1 opportunity (stage `lead`) with a timeline note carrying
+the company's website/phone and why it was accepted.
+
 ## Layout
 
 Code is organized by feature: each of `src/opportunities`, `src/tasks`,
-`src/timeline`, `src/proposals`, `src/paste`, `src/alerts` holds its handlers,
-SQL and types. `src/proposals` is the one writer of deal field values after
-creation.
+`src/timeline`, `src/proposals`, `src/paste`, `src/alerts` (step 1) and
+`src/target_profiles`, `src/companies`, `src/coverage`, `src/importers`,
+`src/places`, `src/crawler`, `src/classifier`, `src/enrichment`, `src/leads`
+(lead gen) holds its handlers, SQL and types. `src/proposals` is the one
+writer of deal field values after creation; `src/companies` is the one
+writer of company rows.
 
 ## Not yet
 
 - Litestream replication of the SQLite file comes later.
-- No auth, frontend, email sync or DuckDB yet.
+- No auth, frontend or email sync yet.
+- DuckDB over the bucket's raw files, once there's enough volume.
+- A cron runner for the lead-gen CLI commands (they're already idempotent
+  and limit-bounded, ready to be scheduled).
+- Lead-gen next steps (IL SOS download automation, status-code mapping,
+  manager/officer join, real Bizapedia columns, contact-level enrichment):
+  see [`docs/lead-gen.md`](docs/lead-gen.md#next-steps).
