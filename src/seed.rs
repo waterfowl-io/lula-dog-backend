@@ -11,11 +11,22 @@ use std::sync::Arc;
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
+use serde_json::json;
 use sqlx::SqlitePool;
+use uuid::Uuid;
 
+use crate::app_definition::AppDefinitionDoc;
+use crate::config;
+use crate::control::app_definitions;
+use crate::control::saved_queries::{self, NewSavedQuery};
+use crate::control::workspaces;
+use crate::control::{ControlPool, profiles};
 use crate::extractor::{Extractor, StubExtractor};
 use crate::opportunities::{self, NewOpportunity, Stage};
-use crate::{paste, tasks};
+use crate::{app_definition, paste, tasks};
+
+const DEV_USER_EMAIL: &str = "jack@lula.dog.example";
+const JACKS_WORKSPACE_NAME: &str = "Jack's Packaging";
 
 pub struct SeedSummary {
     pub opportunities: usize,
@@ -277,4 +288,431 @@ pub async fn run(pool: &SqlitePool) -> anyhow::Result<SeedSummary> {
     Ok(SeedSummary {
         opportunities: count,
     })
+}
+
+/// Find or create the dev user's profile and their workspace ("Jack's
+/// Packaging"), returning the workspace id. Idempotent: `AUTH_MODE=dev`'s
+/// default user (`config::DEFAULT_DEV_USER_ID`) ends up owning exactly one
+/// workspace by this name, so a locally-running server (`AUTH_MODE=dev`,
+/// no `X-Dev-User` override) sees it at `GET /me` with no extra setup.
+pub async fn ensure_dev_workspace(control: &ControlPool) -> anyhow::Result<Uuid> {
+    let profile =
+        profiles::upsert_from_jwt(control, config::DEFAULT_DEV_USER_ID, DEV_USER_EMAIL).await?;
+    if let Some(existing) = workspaces::find_by_name(control, JACKS_WORKSPACE_NAME).await? {
+        return Ok(existing.id);
+    }
+    let workspace = workspaces::create(control, JACKS_WORKSPACE_NAME, profile.id).await?;
+    Ok(workspace.id)
+}
+
+/// Create the saved queries and the "Sales" app definition for a workspace,
+/// if they don't already exist.
+pub async fn seed_control_plane(control: &ControlPool, workspace_id: Uuid) -> anyhow::Result<()> {
+    for query in sales_saved_queries() {
+        if saved_queries::find_by_key(control, workspace_id, &query.key)
+            .await?
+            .is_none()
+        {
+            saved_queries::create(control, workspace_id, query).await?;
+        }
+    }
+    if app_definitions::find_by_key(control, workspace_id, "sales")
+        .await?
+        .is_none()
+    {
+        let doc = sales_app_definition();
+        app_definition::validate(control, workspace_id, &doc).await?;
+        let app = app_definitions::create(control, workspace_id, "sales", "Sales").await?;
+        let version =
+            app_definitions::create_version(control, app.id, serde_json::to_value(&doc)?, None)
+                .await?;
+        app_definitions::publish(control, workspace_id, app.id, version.id).await?;
+    }
+    Ok(())
+}
+
+/// Derived-table SQL computing the same `stale` flag as
+/// `opportunities::list_views`'s `VIEW_SQL`, duplicated here (rather than
+/// shared) because it is deliberately a plain, inspectable saved query --
+/// every chart exposes its SQL via the `</>` button.
+const STALE_DEALS_INNER_SQL: &str = "\
+    SELECT o.*, \
+           (o.stage NOT IN ('won', 'lost') \
+            AND (COALESCE(o.last_touch_at, o.created_at) < datetime('now', '-14 days') \
+                 OR EXISTS (SELECT 1 FROM tasks t WHERE t.opportunity_id = o.id AND t.done = 0 \
+                            AND t.due_at IS NOT NULL AND date(t.due_at) < date('now')))) AS stale \
+    FROM opportunities o";
+
+fn sales_saved_queries() -> Vec<NewSavedQuery> {
+    let no_params = json!([]);
+    let opportunity_id_param = json!([{"name": "opportunity_id", "type": "number"}]);
+    vec![
+        NewSavedQuery {
+            key: "pipeline_by_stage".to_owned(),
+            name: "Pipeline by stage".to_owned(),
+            description: Some("Open deals grouped by stage, for the kanban board.".to_owned()),
+            sql_text: "SELECT id, company, stage, value_cents, next_step, last_touch_at \
+                       FROM opportunities WHERE stage NOT IN ('won', 'lost') \
+                       ORDER BY stage, updated_at DESC"
+                .to_owned(),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "deals_table".to_owned(),
+            name: "All deals".to_owned(),
+            description: Some("Every deal, most recently updated first.".to_owned()),
+            sql_text: "SELECT id, company, stage, value_cents, contact_name, contact_email, \
+                       next_step, last_touch_at, updated_at FROM opportunities \
+                       ORDER BY updated_at DESC"
+                .to_owned(),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "stale_deals".to_owned(),
+            name: "Stale deals".to_owned(),
+            description: Some(
+                "Open deals untouched in 14+ days, or with an overdue task.".to_owned(),
+            ),
+            sql_text: format!(
+                "SELECT * FROM ({STALE_DEALS_INNER_SQL}) WHERE stale = 1 \
+                 ORDER BY COALESCE(last_touch_at, created_at) ASC"
+            ),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "stale_deals_count".to_owned(),
+            name: "Stale deal count".to_owned(),
+            description: Some("Count of stale deals, for the metric card.".to_owned()),
+            sql_text: format!("SELECT COUNT(*) AS value FROM ({STALE_DEALS_INNER_SQL}) WHERE stale = 1"),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "pipeline_value_by_stage".to_owned(),
+            name: "Pipeline value by stage".to_owned(),
+            description: Some("Open deal count and value, grouped by stage.".to_owned()),
+            sql_text: "SELECT stage, COUNT(*) AS deal_count, COALESCE(SUM(value_cents), 0) AS total_value_cents \
+                       FROM opportunities WHERE stage NOT IN ('won', 'lost') GROUP BY stage"
+                .to_owned(),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "deal_detail".to_owned(),
+            name: "Deal detail".to_owned(),
+            description: Some("One deal by id.".to_owned()),
+            sql_text: "SELECT * FROM opportunities WHERE id = :opportunity_id".to_owned(),
+            params: opportunity_id_param.clone(),
+        },
+        NewSavedQuery {
+            key: "deal_timeline".to_owned(),
+            name: "Deal timeline".to_owned(),
+            description: Some("A deal's timeline entries, newest first.".to_owned()),
+            sql_text: "SELECT * FROM timeline_entries WHERE opportunity_id = :opportunity_id \
+                       ORDER BY created_at DESC"
+                .to_owned(),
+            params: opportunity_id_param.clone(),
+        },
+        NewSavedQuery {
+            key: "deal_proposals".to_owned(),
+            name: "Deal proposals".to_owned(),
+            description: Some("A deal's pending field-change proposals.".to_owned()),
+            sql_text: "SELECT * FROM field_changes WHERE opportunity_id = :opportunity_id \
+                       AND status = 'proposed' ORDER BY created_at"
+                .to_owned(),
+            params: opportunity_id_param.clone(),
+        },
+        NewSavedQuery {
+            key: "deal_tasks".to_owned(),
+            name: "Deal tasks".to_owned(),
+            description: Some("A deal's tasks, open first.".to_owned()),
+            sql_text: "SELECT * FROM tasks WHERE opportunity_id = :opportunity_id \
+                       ORDER BY done, due_at IS NULL, due_at"
+                .to_owned(),
+            params: opportunity_id_param,
+        },
+        NewSavedQuery {
+            key: "lead_queue".to_owned(),
+            name: "Lead queue".to_owned(),
+            description: Some("New (or un-snoozed) leads, highest fit score first.".to_owned()),
+            sql_text: "SELECT lc.id, lc.fit_score, lc.fit_reason, lc.status, lc.snoozed_until, \
+                       c.name AS company_name, c.website, c.phone \
+                       FROM lead_candidates lc JOIN companies c ON c.id = lc.company_id \
+                       WHERE lc.status = 'new' \
+                          OR (lc.status = 'snoozed' \
+                              AND (lc.snoozed_until IS NULL OR lc.snoozed_until <= datetime('now'))) \
+                       ORDER BY lc.fit_score DESC"
+                .to_owned(),
+            params: no_params,
+        },
+    ]
+}
+
+fn query_binding(key: &str) -> app_definition::QueryBinding {
+    app_definition::QueryBinding {
+        query: key.to_owned(),
+        params: std::collections::BTreeMap::new(),
+    }
+}
+
+fn query_binding_with(key: &str, params: &[(&str, &str)]) -> app_definition::QueryBinding {
+    app_definition::QueryBinding {
+        query: key.to_owned(),
+        params: params
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), serde_json::Value::String((*v).to_owned())))
+            .collect(),
+    }
+}
+
+fn action_binding(key: &str) -> app_definition::ActionBinding {
+    app_definition::ActionBinding {
+        action: key.to_owned(),
+        params: std::collections::BTreeMap::new(),
+    }
+}
+
+fn action_binding_with(key: &str, params: &[(&str, &str)]) -> app_definition::ActionBinding {
+    app_definition::ActionBinding {
+        action: key.to_owned(),
+        params: params
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), serde_json::Value::String((*v).to_owned())))
+            .collect(),
+    }
+}
+
+fn props(entries: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+    entries
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), v.clone()))
+        .collect()
+}
+
+/// The dashboard Jack gets from `cargo run -- seed`: a pipeline kanban by
+/// stage, a deals table, a stale-deals metric card and alert list, a
+/// pipeline-value chart, a deal detail page (fields, timeline, a paste
+/// form, proposals, tasks) and a lead queue. Committed as a fixture too at
+/// `fixtures/apps/sales.json`, since the frontend reuses it; a test checks
+/// they match.
+#[expect(
+    clippy::too_many_lines,
+    reason = "a literal app definition reads best as one top-to-bottom struct literal"
+)]
+pub fn sales_app_definition() -> AppDefinitionDoc {
+    use app_definition::{Component, ComponentKind, LayoutNode, Page};
+
+    AppDefinitionDoc {
+        version: 1,
+        pages: vec![
+            Page {
+                id: "pipeline".to_owned(),
+                path: "/".to_owned(),
+                title: "Pipeline".to_owned(),
+                layout: LayoutNode::Column {
+                    children: vec![
+                        LayoutNode::Component {
+                            component_id: "pipeline_kanban".to_owned(),
+                        },
+                        LayoutNode::Row {
+                            children: vec![
+                                LayoutNode::Component {
+                                    component_id: "deals_table".to_owned(),
+                                },
+                                LayoutNode::Column {
+                                    children: vec![
+                                        LayoutNode::Component {
+                                            component_id: "stale_metric".to_owned(),
+                                        },
+                                        LayoutNode::Component {
+                                            component_id: "stale_alerts".to_owned(),
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                        LayoutNode::Component {
+                            component_id: "pipeline_value_chart".to_owned(),
+                        },
+                    ],
+                },
+                components: vec![
+                    Component {
+                        id: "pipeline_kanban".to_owned(),
+                        kind: ComponentKind::Kanban,
+                        title: Some("Pipeline".to_owned()),
+                        query: Some(query_binding("pipeline_by_stage")),
+                        action: Some(action_binding("opportunity.update_stage")),
+                        props: props(&[
+                            ("group_field", json!("stage")),
+                            ("card_title_field", json!("company")),
+                        ]),
+                    },
+                    Component {
+                        id: "deals_table".to_owned(),
+                        kind: ComponentKind::Table,
+                        title: Some("Deals".to_owned()),
+                        query: Some(query_binding("deals_table")),
+                        action: None,
+                        props: serde_json::Map::new(),
+                    },
+                    Component {
+                        id: "stale_metric".to_owned(),
+                        kind: ComponentKind::MetricCard,
+                        title: Some("Stale deals".to_owned()),
+                        query: Some(query_binding("stale_deals_count")),
+                        action: None,
+                        props: props(&[("value_field", json!("value"))]),
+                    },
+                    Component {
+                        id: "stale_alerts".to_owned(),
+                        kind: ComponentKind::List,
+                        title: Some("Needs attention".to_owned()),
+                        query: Some(query_binding("stale_deals")),
+                        action: None,
+                        props: props(&[("item_title_field", json!("company"))]),
+                    },
+                    Component {
+                        id: "pipeline_value_chart".to_owned(),
+                        kind: ComponentKind::Chart,
+                        title: Some("Pipeline value by stage".to_owned()),
+                        query: Some(query_binding("pipeline_value_by_stage")),
+                        action: None,
+                        props: props(&[
+                            ("chart_type", json!("bar")),
+                            ("encoding", json!({"x": "stage", "y": "total_value_cents"})),
+                        ]),
+                    },
+                ],
+            },
+            Page {
+                id: "deal_detail".to_owned(),
+                path: "/deals/:opportunity_id".to_owned(),
+                title: "Deal".to_owned(),
+                layout: LayoutNode::Column {
+                    children: vec![
+                        LayoutNode::Component {
+                            component_id: "deal_detail_view".to_owned(),
+                        },
+                        LayoutNode::Component {
+                            component_id: "deal_timeline".to_owned(),
+                        },
+                        LayoutNode::Component {
+                            component_id: "paste_form".to_owned(),
+                        },
+                        LayoutNode::Component {
+                            component_id: "deal_proposals".to_owned(),
+                        },
+                        LayoutNode::Component {
+                            component_id: "deal_tasks".to_owned(),
+                        },
+                    ],
+                },
+                components: vec![
+                    Component {
+                        id: "deal_detail_view".to_owned(),
+                        kind: ComponentKind::DetailView,
+                        title: Some("Deal".to_owned()),
+                        query: Some(query_binding_with(
+                            "deal_detail",
+                            &[("opportunity_id", "$route.opportunity_id")],
+                        )),
+                        action: None,
+                        props: props(&[(
+                            "fields",
+                            json!([
+                                "company",
+                                "contact_name",
+                                "contact_email",
+                                "value_cents",
+                                "stage",
+                                "next_step",
+                                "last_touch_at"
+                            ]),
+                        )]),
+                    },
+                    Component {
+                        id: "deal_timeline".to_owned(),
+                        kind: ComponentKind::List,
+                        title: Some("Timeline".to_owned()),
+                        query: Some(query_binding_with(
+                            "deal_timeline",
+                            &[("opportunity_id", "$route.opportunity_id")],
+                        )),
+                        action: None,
+                        props: props(&[("item_title_field", json!("summary"))]),
+                    },
+                    Component {
+                        id: "paste_form".to_owned(),
+                        kind: ComponentKind::Form,
+                        title: Some("Paste an email or notes".to_owned()),
+                        query: None,
+                        action: Some(action_binding_with(
+                            "paste.submit",
+                            &[("opportunity_id", "$route.opportunity_id")],
+                        )),
+                        props: props(&[("fields", json!([{"name": "text", "type": "textarea"}]))]),
+                    },
+                    Component {
+                        id: "deal_proposals".to_owned(),
+                        kind: ComponentKind::List,
+                        title: Some("Proposed changes".to_owned()),
+                        query: Some(query_binding_with(
+                            "deal_proposals",
+                            &[("opportunity_id", "$route.opportunity_id")],
+                        )),
+                        action: Some(action_binding("proposal.accept")),
+                        props: props(&[("item_title_field", json!("field"))]),
+                    },
+                    Component {
+                        id: "deal_tasks".to_owned(),
+                        kind: ComponentKind::List,
+                        title: Some("Tasks".to_owned()),
+                        query: Some(query_binding_with(
+                            "deal_tasks",
+                            &[("opportunity_id", "$route.opportunity_id")],
+                        )),
+                        action: Some(action_binding("task.complete")),
+                        props: props(&[("item_title_field", json!("title"))]),
+                    },
+                ],
+            },
+            Page {
+                id: "lead_queue".to_owned(),
+                path: "/leads".to_owned(),
+                title: "Lead queue".to_owned(),
+                layout: LayoutNode::Component {
+                    component_id: "lead_queue_table".to_owned(),
+                },
+                components: vec![Component {
+                    id: "lead_queue_table".to_owned(),
+                    kind: ComponentKind::Table,
+                    title: Some("Lead queue".to_owned()),
+                    query: Some(query_binding("lead_queue")),
+                    action: Some(action_binding("lead.accept")),
+                    props: props(&[(
+                        "columns",
+                        json!(["company_name", "fit_score", "website", "phone"]),
+                    )]),
+                }],
+            },
+        ],
+    }
+}
+
+#[cfg(test)]
+mod control_plane_tests {
+    use super::*;
+
+    #[test]
+    fn committed_sales_fixture_matches_generated() -> anyhow::Result<()> {
+        let generated = serde_json::to_string_pretty(&sales_app_definition())? + "\n";
+        let committed = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/apps/sales.json"
+        ))?;
+        assert_eq!(
+            generated, committed,
+            "fixtures/apps/sales.json is stale; regenerate it from `seed::sales_app_definition()`"
+        );
+        Ok(())
+    }
 }

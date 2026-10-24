@@ -1,0 +1,276 @@
+{
+  "version": 1,
+  "pages": [
+    {
+      "id": "pipeline",
+      "path": "/",
+      "title": "Pipeline",
+      "layout": {
+        "type": "column",
+        "children": [
+          {
+            "type": "component",
+            "component_id": "pipeline_kanban"
+          },
+          {
+            "type": "row",
+            "children": [
+              {
+                "type": "component",
+                "component_id": "deals_table"
+              },
+              {
+                "type": "column",
+                "children": [
+                  {
+                    "type": "component",
+                    "component_id": "stale_metric"
+                  },
+                  {
+                    "type": "component",
+                    "component_id": "stale_alerts"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "component",
+            "component_id": "pipeline_value_chart"
+          }
+        ]
+      },
+      "components": [
+        {
+          "id": "pipeline_kanban",
+          "type": "kanban",
+          "title": "Pipeline",
+          "query": {
+            "query": "pipeline_by_stage",
+            "params": {}
+          },
+          "action": {
+            "action": "opportunity.update_stage",
+            "params": {}
+          },
+          "props": {
+            "card_title_field": "company",
+            "group_field": "stage"
+          }
+        },
+        {
+          "id": "deals_table",
+          "type": "table",
+          "title": "Deals",
+          "query": {
+            "query": "deals_table",
+            "params": {}
+          },
+          "action": null,
+          "props": {}
+        },
+        {
+          "id": "stale_metric",
+          "type": "metric_card",
+          "title": "Stale deals",
+          "query": {
+            "query": "stale_deals_count",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "value_field": "value"
+          }
+        },
+        {
+          "id": "stale_alerts",
+          "type": "list",
+          "title": "Needs attention",
+          "query": {
+            "query": "stale_deals",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "item_title_field": "company"
+          }
+        },
+        {
+          "id": "pipeline_value_chart",
+          "type": "chart",
+          "title": "Pipeline value by stage",
+          "query": {
+            "query": "pipeline_value_by_stage",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "chart_type": "bar",
+            "encoding": {
+              "x": "stage",
+              "y": "total_value_cents"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "deal_detail",
+      "path": "/deals/:opportunity_id",
+      "title": "Deal",
+      "layout": {
+        "type": "column",
+        "children": [
+          {
+            "type": "component",
+            "component_id": "deal_detail_view"
+          },
+          {
+            "type": "component",
+            "component_id": "deal_timeline"
+          },
+          {
+            "type": "component",
+            "component_id": "paste_form"
+          },
+          {
+            "type": "component",
+            "component_id": "deal_proposals"
+          },
+          {
+            "type": "component",
+            "component_id": "deal_tasks"
+          }
+        ]
+      },
+      "components": [
+        {
+          "id": "deal_detail_view",
+          "type": "detail_view",
+          "title": "Deal",
+          "query": {
+            "query": "deal_detail",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "action": null,
+          "props": {
+            "fields": [
+              "company",
+              "contact_name",
+              "contact_email",
+              "value_cents",
+              "stage",
+              "next_step",
+              "last_touch_at"
+            ]
+          }
+        },
+        {
+          "id": "deal_timeline",
+          "type": "list",
+          "title": "Timeline",
+          "query": {
+            "query": "deal_timeline",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "action": null,
+          "props": {
+            "item_title_field": "summary"
+          }
+        },
+        {
+          "id": "paste_form",
+          "type": "form",
+          "title": "Paste an email or notes",
+          "query": null,
+          "action": {
+            "action": "paste.submit",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "props": {
+            "fields": [
+              {
+                "name": "text",
+                "type": "textarea"
+              }
+            ]
+          }
+        },
+        {
+          "id": "deal_proposals",
+          "type": "list",
+          "title": "Proposed changes",
+          "query": {
+            "query": "deal_proposals",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "action": {
+            "action": "proposal.accept",
+            "params": {}
+          },
+          "props": {
+            "item_title_field": "field"
+          }
+        },
+        {
+          "id": "deal_tasks",
+          "type": "list",
+          "title": "Tasks",
+          "query": {
+            "query": "deal_tasks",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "action": {
+            "action": "task.complete",
+            "params": {}
+          },
+          "props": {
+            "item_title_field": "title"
+          }
+        }
+      ]
+    },
+    {
+      "id": "lead_queue",
+      "path": "/leads",
+      "title": "Lead queue",
+      "layout": {
+        "type": "component",
+        "component_id": "lead_queue_table"
+      },
+      "components": [
+        {
+          "id": "lead_queue_table",
+          "type": "table",
+          "title": "Lead queue",
+          "query": {
+            "query": "lead_queue",
+            "params": {}
+          },
+          "action": {
+            "action": "lead.accept",
+            "params": {}
+          },
+          "props": {
+            "columns": [
+              "company_name",
+              "fit_score",
+              "website",
+              "phone"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
