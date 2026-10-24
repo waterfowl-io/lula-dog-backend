@@ -1,0 +1,87 @@
+[package]
+name = "lula-dog-backend"
+version = "0.1.0"
+edition = "2024"
+default-run = "lula-dog-backend"
+publish = false
+license = "UNLICENSED"
+
+[[bin]]
+name = "lula-dog-backend"
+path = "src/main.rs"
+
+[dependencies]
+# Web
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# DB. sqlx's `sqlite` feature bundles SQLite, so there is no system library to
+# install. Only the runtime query API is used (no `query!` macros), so building
+# never needs a DATABASE_URL; `macros` is here for `migrate!` and `FromRow`.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "migrate",
+] }
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time. Timestamps are stored as TEXT in SQLite's own CURRENT_TIMESTAMP format;
+# chrono parses what callers and the extractor send and normalizes it.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Env / config
+dotenvy = "0.15"
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client for the xAI extractor. rustls, not native-tls: no system OpenSSL.
+# reqwest's default features include native-tls, so `default-features = false`
+# is what actually removes it.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# The extractor trait is used as `Arc<dyn Extractor>`; native async fn in traits
+# is not dyn-compatible.
+async-trait = "0.1"
+
+# OpenAPI, served at /openapi.json so agents can discover the API.
+utoipa = { version = "5", features = ["axum_extras"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Documentation/style lints from pedantic+nursery that are noise here.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_long_first_doc_paragraph = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_const_for_fn = "allow"
+doc_markdown = "allow"
+significant_drop_tightening = "allow"
+
+# The safety set, at DENY. Non-test code has no business aborting the process: a
+# panic in a handler takes the connection with it and tells the caller nothing.
+# Test crates relax this with a crate-level `#![expect(...)]`.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
