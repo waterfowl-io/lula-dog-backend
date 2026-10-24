@@ -228,7 +228,7 @@ TODO: Call Dana about pallet count
         assert_eq!(got.summary.as_deref(), Some("just a note"));
         assert_eq!(got.value_cents, None);
         assert_eq!(got.latest_date, None);
-        assert!(got.tasks.is_empty());
+        assert_eq!(got.tasks.len(), 0);
     }
 
     #[test]
