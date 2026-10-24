@@ -63,10 +63,89 @@ async fn seeds_an_empty_database_once() {
         .sum();
     assert!(open_tasks >= 3);
 
-    assert!(
-        seed::run(&app.pool, 50).await.is_err(),
-        "second run must refuse"
+    // Re-running against an already-seeded database is the normal upgrade
+    // path (a developer's persistent DATA_DIR) -- it must not error, and
+    // must not duplicate the deals or leads that are already there.
+    let summary = seed::run(&app.pool, 50).await.unwrap();
+    assert_eq!(
+        summary.opportunities, 0,
+        "existing opportunities must not be re-seeded"
     );
+    assert_eq!(summary.leads, 0, "existing leads must not be re-seeded");
+
+    let opportunities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM opportunities")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        opportunities, 8,
+        "second run must not duplicate opportunities"
+    );
+    let leads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lead_candidates")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(leads, 4, "second run must not duplicate leads");
+}
+
+/// A developer's existing dev database, seeded before the example leads
+/// existed: opportunities are already there, but `lead_candidates` is
+/// empty. Re-running `seed::run` (the `cargo run -- seed` upgrade path)
+/// must backfill the leads without touching the existing deals, and a
+/// further run must not duplicate them.
+#[tokio::test]
+async fn backfills_leads_into_an_existing_database_missing_them() {
+    let app = TestApp::new().await;
+
+    let mut conn = app.pool.acquire().await.unwrap();
+    lula_dog_backend::target_profiles::seed_default(&mut conn, 50)
+        .await
+        .unwrap();
+    lula_dog_backend::opportunities::insert(
+        &mut conn,
+        lula_dog_backend::opportunities::NewOpportunity {
+            company: "Existing Co".to_owned(),
+            contact_name: None,
+            contact_email: None,
+            value_cents: None,
+            stage: Some(lula_dog_backend::opportunities::Stage::Lead),
+            next_step: None,
+            last_touch_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    let summary = seed::run(&app.pool, 50).await.unwrap();
+    assert_eq!(
+        summary.opportunities, 0,
+        "existing opportunities must not be re-seeded"
+    );
+    assert_eq!(summary.leads, 4, "missing leads must be backfilled");
+
+    let opportunities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM opportunities")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        opportunities, 1,
+        "pre-existing opportunity must be untouched"
+    );
+    let leads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lead_candidates")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(leads, 4);
+
+    // A third run must not duplicate the now-present leads.
+    let summary = seed::run(&app.pool, 50).await.unwrap();
+    assert_eq!(summary.leads, 0, "third run must not duplicate leads");
+    let leads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lead_candidates")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(leads, 4, "third run must not duplicate leads");
 }
 
 /// Re-running `seed_control_plane` against a workspace that already has the

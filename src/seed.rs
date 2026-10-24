@@ -9,10 +9,9 @@
 
 use std::sync::Arc;
 
-use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::app_definition::AppDefinitionDoc;
@@ -60,31 +59,73 @@ fn opp(company: &str, name: &str, email: &str, stage: Stage) -> NewOpportunity {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "seed data reads best as one top-to-bottom list of deals"
-)]
+/// Fill an empty workspace database with the example deals/leads, and
+/// upgrade an already-seeded one.
+///
+/// Re-running this against a developer's existing `DATA_DIR` is the normal
+/// case (not a fresh database), so each piece is seeded independently and
+/// idempotently rather than refusing outright:
+/// - the example deals/timeline only ever seed once (an empty
+///   `opportunities` table), since they're hand-tuned to read as fresh
+///   relative to "now" and re-inserting them on top of real data would be
+///   nonsensical;
+/// - the example leads/companies backfill whenever `lead_candidates` is
+///   empty, so a database seeded before leads existed picks them up on the
+///   next `cargo run -- seed` without duplicating on further runs.
 pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<SeedSummary> {
     let mut conn = pool.acquire().await?;
-    let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM opportunities")
-        .fetch_one(&mut *conn)
-        .await?;
-    if existing > 0 {
-        bail!(
-            "database already has {existing} opportunities; seed only runs on an empty database \
-             (delete the database file to start over)"
-        );
-    }
     target_profiles::seed_default(&mut conn, lead_min_fit_score).await?;
     let profile = target_profiles::first(&mut conn)
         .await?
         .ok_or_else(|| anyhow::anyhow!("just seeded a default target profile"))?;
+
+    let existing_opportunities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM opportunities")
+        .fetch_one(&mut *conn)
+        .await?;
+    let opportunities = if existing_opportunities > 0 {
+        tracing::info!(
+            existing_opportunities,
+            "opportunities already seeded; skipping the example deal/timeline seed \
+             (delete the workspace database to re-seed deals from scratch)"
+        );
+        0
+    } else {
+        seed_opportunities(pool, &mut conn).await?
+    };
+
+    let existing_leads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lead_candidates")
+        .fetch_one(&mut *conn)
+        .await?;
+    let leads = if existing_leads > 0 {
+        tracing::info!(
+            existing_leads,
+            "lead_candidates already seeded; skipping example leads"
+        );
+        0
+    } else {
+        seed_leads(&mut conn, profile.id).await?
+    };
+
+    Ok(SeedSummary {
+        opportunities,
+        leads,
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "seed data reads best as one top-to-bottom list of deals"
+)]
+async fn seed_opportunities(
+    pool: &SqlitePool,
+    conn: &mut SqliteConnection,
+) -> anyhow::Result<usize> {
     let extractor: Arc<dyn Extractor> = Arc::new(StubExtractor);
     let mut count = 0;
 
     // 1. Corrugated mailer boxes, proposal out, touched 3 days ago.
     let northwind = opportunities::insert(
-        &mut conn,
+        conn,
         NewOpportunity {
             value_cents: Some(840_000),
             ..opp(
@@ -117,7 +158,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
 
     // 2. Poly mailers, qualified, last touch 20 days ago: STALE.
     let bluebird = opportunities::insert(
-        &mut conn,
+        conn,
         NewOpportunity {
             value_cents: Some(375_000),
             ..opp(
@@ -147,7 +188,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
 
     // 3. Pallets, lead, touched recently but with an overdue task: STALE.
     let ridgeline = opportunities::insert(
-        &mut conn,
+        conn,
         NewOpportunity {
             last_touch_at: Some(ts(days_ago(5))),
             next_step: Some("Confirm pallet spec and monthly volume".to_owned()),
@@ -162,7 +203,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
     .await?;
     count += 1;
     tasks::insert(
-        &mut conn,
+        conn,
         ridgeline.id,
         "Send GMA 48x40 heat-treated pallet pricing",
         Some(&date(days_ago(3))),
@@ -172,7 +213,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
 
     // 4. Repeat order of RSC boxes, won a month ago (won deals are never stale).
     opportunities::insert(
-        &mut conn,
+        conn,
         NewOpportunity {
             value_cents: Some(298_000),
             last_touch_at: Some(ts(days_ago(30))),
@@ -191,7 +232,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
     // 5. Double-wall boxes, proposal; the latest email states a new total, so
     //    the paste leaves a pending value_cents proposal.
     let summit = opportunities::insert(
-        &mut conn,
+        conn,
         NewOpportunity {
             value_cents: Some(1_450_000),
             ..opp(
@@ -224,7 +265,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
 
     // 6. Repeat poly mailer order, qualified, touched 8 days ago.
     let prairie = opportunities::insert(
-        &mut conn,
+        conn,
         NewOpportunity {
             value_cents: Some(190_000),
             last_touch_at: Some(ts(days_ago(8))),
@@ -240,7 +281,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
     .await?;
     count += 1;
     tasks::insert(
-        &mut conn,
+        conn,
         prairie.id,
         "Confirm repeat order: 10,000 12x15.5 poly mailers",
         Some(&date(days_ago(-5))),
@@ -250,7 +291,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
 
     // 7. Lost to another supplier.
     let coastal = opportunities::insert(
-        &mut conn,
+        conn,
         NewOpportunity {
             value_cents: Some(450_000),
             ..opp(
@@ -279,7 +320,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
 
     // 8. Brand-new lead, no touch yet.
     opportunities::insert(
-        &mut conn,
+        conn,
         NewOpportunity {
             next_step: Some("Intro call about 12-pack carriers and pallets".to_owned()),
             ..opp(
@@ -293,9 +334,13 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
     .await?;
     count += 1;
 
-    // The lead queue: a handful of clearly-fake companies (`.example`
-    // domains, same convention as the opportunities above) queued as lead
-    // candidates so `/leads` isn't empty out of the box.
+    Ok(count)
+}
+
+/// The lead queue: a handful of clearly-fake companies (`.example` domains,
+/// same convention as the example opportunities) queued as lead candidates
+/// so `/leads` isn't empty out of the box.
+async fn seed_leads(conn: &mut SqliteConnection, profile_id: i64) -> anyhow::Result<usize> {
     let lead_defs: &[(&str, &str, &str, i64, &str)] = &[
         (
             "Bluebird Coffee Roasters",
@@ -329,7 +374,7 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
     let mut lead_count = 0;
     for (name, domain, category, fit_score, fit_reason) in lead_defs {
         let company = companies::upsert(
-            &mut conn,
+            conn,
             NewCompany {
                 name: (*name).to_owned(),
                 jurisdiction: "IL".to_owned(),
@@ -339,24 +384,15 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
             },
         )
         .await?;
-        if leads::queue_candidate(
-            &mut conn,
-            company.id,
-            profile.id,
-            *fit_score,
-            Some(fit_reason),
-        )
-        .await?
-        .is_some()
+        if leads::queue_candidate(conn, company.id, profile_id, *fit_score, Some(fit_reason))
+            .await?
+            .is_some()
         {
             lead_count += 1;
         }
     }
 
-    Ok(SeedSummary {
-        opportunities: count,
-        leads: lead_count,
-    })
+    Ok(lead_count)
 }
 
 /// Find or create the dev user's profile and their workspace ("Jack's
