@@ -26,16 +26,16 @@ async fn health_and_openapi() {
     assert_eq!(status, StatusCode::OK);
     for path in [
         "/health",
-        "/opportunities",
-        "/opportunities/{id}",
-        "/opportunities/{id}/tasks",
-        "/opportunities/{id}/paste",
-        "/opportunities/{id}/proposals/accept-all",
-        "/opportunities/{id}/proposals/dismiss-all",
-        "/tasks/{id}",
-        "/proposals/{id}/accept",
-        "/proposals/{id}/reject",
-        "/alerts/stale",
+        "/w/{workspace_id}/opportunities",
+        "/w/{workspace_id}/opportunities/{id}",
+        "/w/{workspace_id}/opportunities/{id}/tasks",
+        "/w/{workspace_id}/opportunities/{id}/paste",
+        "/w/{workspace_id}/opportunities/{id}/proposals/accept-all",
+        "/w/{workspace_id}/opportunities/{id}/proposals/dismiss-all",
+        "/w/{workspace_id}/tasks/{id}",
+        "/w/{workspace_id}/proposals/{id}/accept",
+        "/w/{workspace_id}/proposals/{id}/reject",
+        "/w/{workspace_id}/alerts/stale",
     ] {
         assert!(spec["paths"][path].is_object(), "missing {path} in spec");
     }

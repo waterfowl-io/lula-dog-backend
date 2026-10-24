@@ -2,18 +2,17 @@
 //! open-task counts and the `stale` flag, and the detail view.
 
 use axum::Json;
-use axum::extract::State;
 use axum::http::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::{FromRow, SqliteConnection};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::extract::{ApiJson, ApiPath, ApiQuery};
+use crate::extract::{ApiJson, ApiPath, ApiQuery, IdPath};
 use crate::proposals::{self, Field, FieldChange};
 use crate::tasks::{self, Task};
 use crate::timeline::{self, TimelineEntry};
+use crate::workspace_db::WorkspaceContext;
 
 /// Days without a touch after which an open deal is stale.
 pub const STALE_AFTER_DAYS: i64 = 14;
@@ -163,8 +162,8 @@ pub struct ListQuery {
 /// List opportunities, newest activity first.
 #[utoipa::path(
     get,
-    path = "/opportunities",
-    params(ListQuery),
+    path = "/w/{workspace_id}/opportunities",
+    params(("workspace_id" = Uuid, Path), ListQuery),
     responses(
         (status = 200, body = [OpportunityView]),
         (status = 400, body = crate::error::ErrorBody),
@@ -172,10 +171,10 @@ pub struct ListQuery {
     tag = "opportunities"
 )]
 pub async fn list(
-    State(state): State<AppState>,
+    ws: WorkspaceContext,
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> AppResult<Json<Vec<OpportunityView>>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     Ok(Json(list_views(&mut conn, query.stage, false).await?))
 }
 
@@ -232,7 +231,8 @@ fn norm(field: Field, value: Option<&str>) -> AppResult<Option<String>> {
 /// Create an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities",
+    path = "/w/{workspace_id}/opportunities",
+    params(("workspace_id" = Uuid, Path)),
     request_body = NewOpportunity,
     responses(
         (status = 201, body = OpportunityView),
@@ -241,10 +241,10 @@ fn norm(field: Field, value: Option<&str>) -> AppResult<Option<String>> {
     tag = "opportunities"
 )]
 pub async fn create(
-    State(state): State<AppState>,
+    ws: WorkspaceContext,
     ApiJson(new): ApiJson<NewOpportunity>,
 ) -> AppResult<(StatusCode, Json<OpportunityView>)> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let created = insert(&mut conn, new).await?;
     Ok((
         StatusCode::CREATED,
@@ -266,8 +266,8 @@ pub struct OpportunityDetail {
 /// One opportunity with its timeline, pending proposals and tasks.
 #[utoipa::path(
     get,
-    path = "/opportunities/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = OpportunityDetail),
         (status = 404, body = crate::error::ErrorBody),
@@ -275,10 +275,10 @@ pub struct OpportunityDetail {
     tag = "opportunities"
 )]
 pub async fn get(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<OpportunityDetail>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let opportunity = fetch_view(&mut conn, id).await?;
     Ok(Json(OpportunityDetail {
         opportunity,
@@ -367,8 +367,8 @@ impl OpportunityPatch {
 /// as an accepted change with no source entry.
 #[utoipa::path(
     patch,
-    path = "/opportunities/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = OpportunityPatch,
     responses(
         (status = 200, body = OpportunityView),
@@ -378,11 +378,11 @@ impl OpportunityPatch {
     tag = "opportunities"
 )]
 pub async fn patch(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(patch): ApiJson<OpportunityPatch>,
 ) -> AppResult<Json<OpportunityView>> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = ws.pool.begin().await?;
     let mut current = fetch(&mut tx, id).await?;
     for (field, value) in patch.changes() {
         let value = norm(field, value.as_deref())?;

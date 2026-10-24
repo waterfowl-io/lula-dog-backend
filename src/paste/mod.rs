@@ -23,12 +23,13 @@ use utoipa::ToSchema;
 
 use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::extract::{ApiJson, ApiPath};
+use crate::extract::{ApiJson, ApiPath, IdPath};
 use crate::extractor::{Extraction, ExtractionInput, Extractor};
 use crate::opportunities::{self, Opportunity};
 use crate::proposals::{self, Field, FieldChange};
 use crate::tasks::{self, Task};
 use crate::timeline::{self, TimelineEntry};
+use crate::workspace_db::WorkspaceContext;
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -54,8 +55,8 @@ pub struct PasteResponse {
 /// Paste an email thread or notes onto an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities/{id}/paste",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}/paste",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = PasteRequest,
     responses(
         (status = 201, body = PasteResponse),
@@ -66,13 +67,14 @@ pub struct PasteResponse {
 )]
 pub async fn paste(
     State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(req): ApiJson<PasteRequest>,
 ) -> AppResult<(StatusCode, Json<PasteResponse>)> {
     if req.text.trim().is_empty() {
         return Err(AppError::BadRequest("text cannot be empty".to_owned()));
     }
-    let response = run(&state.pool, &state.extractor, id, &req.text).await?;
+    let response = run(&ws.pool, &state.extractor, id, &req.text).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 

@@ -2,16 +2,15 @@
 //! a pasted thread (then `source_entry_id` points at that entry).
 
 use axum::Json;
-use axum::extract::State;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqliteConnection};
 use utoipa::ToSchema;
 
-use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::extract::{ApiJson, ApiPath};
+use crate::extract::{ApiJson, ApiPath, IdPath};
 use crate::opportunities::{self, not_null, nullable};
+use crate::workspace_db::WorkspaceContext;
 
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct Task {
@@ -94,8 +93,8 @@ pub struct NewTask {
 /// Add a task to an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities/{id}/tasks",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}/tasks",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = NewTask,
     responses(
         (status = 201, body = Task),
@@ -105,11 +104,11 @@ pub struct NewTask {
     tag = "tasks"
 )]
 pub async fn create(
-    State(state): State<AppState>,
-    ApiPath(opportunity_id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id: opportunity_id }): ApiPath<IdPath>,
     ApiJson(new): ApiJson<NewTask>,
 ) -> AppResult<(StatusCode, Json<Task>)> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     opportunities::fetch(&mut conn, opportunity_id).await?;
     let task = insert(
         &mut conn,
@@ -138,8 +137,8 @@ pub struct TaskPatch {
 /// Edit a task or mark it done.
 #[utoipa::path(
     patch,
-    path = "/tasks/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/tasks/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = TaskPatch,
     responses(
         (status = 200, body = Task),
@@ -149,11 +148,11 @@ pub struct TaskPatch {
     tag = "tasks"
 )]
 pub async fn patch(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(patch): ApiJson<TaskPatch>,
 ) -> AppResult<Json<Task>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let current = fetch(&mut conn, id).await?;
     let new_title = match patch.title {
         Some(t) => title(&t)?,
@@ -179,8 +178,8 @@ pub async fn patch(
 /// Delete a task.
 #[utoipa::path(
     delete,
-    path = "/tasks/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/tasks/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 204),
         (status = 404, body = crate::error::ErrorBody),
@@ -188,10 +187,10 @@ pub async fn patch(
     tag = "tasks"
 )]
 pub async fn delete(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<StatusCode> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let deleted = sqlx::query("DELETE FROM tasks WHERE id = ?1")
         .bind(id)
         .execute(&mut *conn)

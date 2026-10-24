@@ -1,11 +1,17 @@
-//! Lula.dog backend: structured sales data for AI agents. SQLite is the
-//! system of record.
+//! Lula.dog backend: structured sales data for AI agents. Supabase Postgres
+//! is the control plane (workspaces, membership, app definitions, saved
+//! queries); one SQLite file per workspace is the system of record for that
+//! workspace's editable data. See `docs/architecture.md`.
 
 pub mod alerts;
+pub mod app_definition;
+pub mod apps;
+pub mod auth;
 pub mod bucket;
 pub mod classifier;
 pub mod companies;
 pub mod config;
+pub mod control;
 pub mod coverage;
 pub mod crawler;
 pub mod db;
@@ -15,36 +21,57 @@ pub mod extract;
 pub mod extractor;
 pub mod importers;
 pub mod leads;
+pub mod me;
 pub mod opportunities;
 pub mod paste;
 pub mod places;
 pub mod proposals;
+pub mod queries;
+pub mod query_runner;
+pub mod schema;
 pub mod seed;
 pub mod target_profiles;
 pub mod tasks;
 pub mod time;
 pub mod timeline;
+pub mod workspace_db;
 
 use std::sync::Arc;
 
 use axum::extract::State;
 use axum::routing::{get, patch, post};
-use axum::{Json, Router};
+use axum::{Json, Router, middleware};
 use serde::Serialize;
-use sqlx::SqlitePool;
 use utoipa::{OpenApi, ToSchema};
 
+use crate::auth::Auth;
 use crate::classifier::{Classifier, GrokClassifier, StubClassifier};
 use crate::config::{ClassifierConfig, CrawlerConfig, ExtractorConfig, PlacesConfig};
+use crate::control::ControlPool;
 use crate::crawler::{Fetcher, HttpFetcher, StubFetcher};
 use crate::error::AppResult;
 use crate::extractor::{Extractor, GrokExtractor, StubExtractor};
 use crate::places::{GooglePlacesClient, PlacesClient, StubPlacesClient};
+use crate::workspace_db::WorkspaceRegistry;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: SqlitePool,
     pub extractor: Arc<dyn Extractor>,
+    /// The Supabase Postgres control plane. `None` disables workspace
+    /// membership enforcement (every workspace id is accessible as
+    /// `owner`) -- see `workspace_db::scope`.
+    pub control: Option<ControlPool>,
+    pub workspaces: WorkspaceRegistry,
+    pub auth: Arc<Auth>,
+    /// Hard cap on rows returned by `POST /w/{ws}/queries/{id}/run`.
+    pub query_max_rows: i64,
+    pub query_timeout_ms: u64,
+}
+
+impl AsRef<Auth> for AppState {
+    fn as_ref(&self) -> &Auth {
+        &self.auth
+    }
 }
 
 pub fn extractor_from_config(config: &ExtractorConfig) -> anyhow::Result<Arc<dyn Extractor>> {
@@ -101,9 +128,7 @@ pub fn classifier_from_config(config: &ClassifierConfig) -> anyhow::Result<Arc<d
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/openapi.json", get(openapi))
+    let workspace_routes = Router::new()
         .route(
             "/opportunities",
             get(opportunities::list).post(opportunities::create),
@@ -140,6 +165,39 @@ pub fn router(state: AppState) -> Router {
         .route("/leads/{id}/accept", post(leads::accept))
         .route("/leads/{id}/reject", post(leads::reject))
         .route("/leads/{id}/snooze", post(leads::snooze))
+        .route("/apps", get(apps::list).post(apps::create))
+        .route("/apps/{app}", get(apps::get))
+        .route(
+            "/apps/{app}/versions",
+            get(apps::list_versions).post(apps::create_version),
+        )
+        .route(
+            "/apps/{app}/versions/{version}/publish",
+            post(apps::publish),
+        )
+        .route("/apps/{app}/rollback", post(apps::rollback))
+        .route("/queries", get(queries::list).post(queries::create))
+        .route("/queries/{id}", get(queries::get))
+        .route("/queries/{id}/run", post(query_runner::run))
+        .route("/schema", get(schema::get_catalog))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            workspace_db::scope,
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/openapi.json", get(openapi))
+        .route(
+            "/app-definition.schema.json",
+            get(app_definition::schema_json),
+        )
+        .route("/me", get(me::get))
+        .route(
+            "/workspaces",
+            get(me::list_workspaces).post(me::create_workspace),
+        )
+        .nest("/w/{workspace_id}", workspace_routes)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -149,7 +207,7 @@ pub struct Health {
     pub status: &'static str,
 }
 
-/// Liveness plus a database round trip.
+/// Liveness, plus a control-plane round trip when one is configured.
 #[utoipa::path(
     get,
     path = "/health",
@@ -157,15 +215,24 @@ pub struct Health {
     tag = "health"
 )]
 pub async fn health(State(state): State<AppState>) -> AppResult<Json<Health>> {
-    sqlx::query("SELECT 1").execute(&state.pool).await?;
+    if let Some(control) = &state.control {
+        sqlx::query("SELECT 1").execute(control).await?;
+    }
     Ok(Json(Health { status: "ok" }))
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    info(title = "Lula.dog API", description = "Sales opportunity tracker"),
+    info(
+        title = "Lula.dog API",
+        description = "Sales opportunity tracker and app platform"
+    ),
     paths(
         health,
+        me::get,
+        me::list_workspaces,
+        me::create_workspace,
+        app_definition::schema_json,
         opportunities::list,
         opportunities::create,
         opportunities::get,
@@ -188,6 +255,18 @@ pub async fn health(State(state): State<AppState>) -> AppResult<Json<Health>> {
         leads::accept,
         leads::reject,
         leads::snooze,
+        apps::list,
+        apps::create,
+        apps::get,
+        apps::list_versions,
+        apps::create_version,
+        apps::publish,
+        apps::rollback,
+        queries::list,
+        queries::create,
+        queries::get,
+        query_runner::run,
+        schema::get_catalog,
     )
 )]
 pub struct ApiDoc;

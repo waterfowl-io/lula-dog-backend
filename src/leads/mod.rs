@@ -3,18 +3,17 @@
 //! one into a step-1 opportunity.
 
 use axum::Json;
-use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqliteConnection};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::AppState;
 use crate::classifier::Classification;
 use crate::companies::{self, Company};
 use crate::error::{AppError, AppResult};
-use crate::extract::{ApiJson, ApiPath, ApiQuery};
+use crate::extract::{ApiJson, ApiPath, ApiQuery, IdPath};
 use crate::opportunities::{self, NewOpportunity, Stage};
 use crate::timeline;
+use crate::workspace_db::WorkspaceContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -114,8 +113,8 @@ pub struct ListQuery {
 /// List leads, highest fit score first.
 #[utoipa::path(
     get,
-    path = "/leads",
-    params(ListQuery),
+    path = "/w/{workspace_id}/leads",
+    params(("workspace_id" = Uuid, Path), ListQuery),
     responses(
         (status = 200, body = [LeadView]),
         (status = 400, body = crate::error::ErrorBody),
@@ -123,10 +122,10 @@ pub struct ListQuery {
     tag = "leads"
 )]
 pub async fn list(
-    State(state): State<AppState>,
+    ws: WorkspaceContext,
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> AppResult<Json<Vec<LeadView>>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let status = query.status.unwrap_or(LeadStatus::New);
     let sql = format!(
         "SELECT lc.*, {EFFECTIVE_STATUS_SQL} AS status,
@@ -220,8 +219,8 @@ pub struct AcceptResponse {
 /// why it was accepted.
 #[utoipa::path(
     post,
-    path = "/leads/{id}/accept",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/leads/{id}/accept",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = AcceptResponse),
         (status = 404, body = crate::error::ErrorBody),
@@ -230,10 +229,10 @@ pub struct AcceptResponse {
     tag = "leads"
 )]
 pub async fn accept(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<AcceptResponse>> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = ws.pool.begin().await?;
     let lead = claim_or_conflict(&mut tx, id, "status = 'accepted'").await?;
     let company = companies::fetch(&mut tx, lead.company_id).await?;
 
@@ -282,8 +281,8 @@ pub struct RejectRequest {
 /// Reject a lead.
 #[utoipa::path(
     post,
-    path = "/leads/{id}/reject",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/leads/{id}/reject",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = RejectRequest,
     responses(
         (status = 200, body = LeadCandidate),
@@ -293,14 +292,14 @@ pub struct RejectRequest {
     tag = "leads"
 )]
 pub async fn reject(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(req): ApiJson<RejectRequest>,
 ) -> AppResult<Json<LeadCandidate>> {
     if req.reason.trim().is_empty() {
         return Err(AppError::BadRequest("reason cannot be empty".to_owned()));
     }
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let sql = format!(
         "UPDATE lead_candidates SET status = 'rejected', reject_reason = ?2, updated_at = CURRENT_TIMESTAMP
          WHERE id = ?1 AND {EFFECTIVE_STATUS_SQL} = 'new'
@@ -336,8 +335,8 @@ pub struct SnoozeRequest {
 /// passed.
 #[utoipa::path(
     post,
-    path = "/leads/{id}/snooze",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/leads/{id}/snooze",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = SnoozeRequest,
     responses(
         (status = 200, body = LeadCandidate),
@@ -348,8 +347,8 @@ pub struct SnoozeRequest {
     tag = "leads"
 )]
 pub async fn snooze(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(req): ApiJson<SnoozeRequest>,
 ) -> AppResult<Json<LeadCandidate>> {
     let until = crate::time::normalize(&req.until).ok_or_else(|| {
@@ -358,7 +357,7 @@ pub async fn snooze(
             req.until
         ))
     })?;
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let sql = format!(
         "UPDATE lead_candidates SET status = 'snoozed', snoozed_until = ?2, updated_at = CURRENT_TIMESTAMP
          WHERE id = ?1 AND {EFFECTIVE_STATUS_SQL} = 'new'

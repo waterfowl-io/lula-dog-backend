@@ -1,17 +1,27 @@
 //! `lula-dog-backend [serve|seed|import ...]`. `serve` is the default.
+//!
+//! `seed`, `import`, `enrich` and `classify` all operate on one workspace's
+//! SQLite file, chosen with `--workspace <uuid>` (default: the legacy
+//! single-tenant workspace that reads `DATABASE_URL` directly -- see
+//! `config::DEFAULT_WORKSPACE_ID`).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::bail;
+use lula_dog_backend::auth::Auth;
 use lula_dog_backend::bucket::Bucket;
-use lula_dog_backend::config::Config;
+use lula_dog_backend::config::{self, Config};
 use lula_dog_backend::importers::bizapedia::{self, ColumnMapping};
 use lula_dog_backend::importers::il_sos_llc;
+use lula_dog_backend::workspace_db::WorkspaceRegistry;
 use lula_dog_backend::{
-    AppState, classifier_from_config, db, enrichment, extractor_from_config, fetcher_from_config,
-    places_from_config, router, seed, target_profiles,
+    AppState, classifier_from_config, control, enrichment, extractor_from_config,
+    fetcher_from_config, places_from_config, router, seed, target_profiles,
 };
+use sqlx::SqlitePool;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("serve") => serve(config).await,
-        Some("seed") => seed_cmd(config).await,
+        Some("seed") => seed_cmd(config, parse_flags(args.get(1..).unwrap_or_default())).await,
         Some("import") => import_cmd(config, args.get(1..).unwrap_or_default()).await,
         Some("enrich") => enrich_cmd(config, parse_flags(args.get(1..).unwrap_or_default())).await,
         Some("classify") => {
@@ -41,9 +51,27 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(?config, "starting");
-    let pool = db::connect(&config.database_url).await?;
+    let control = if let Some(url) = &config.control_database_url {
+        Some(control::connect(url).await?)
+    } else {
+        tracing::warn!(
+            "CONTROL_DATABASE_URL is not set: workspace-membership checks are DISABLED \
+             (every workspace id is accessible as `owner`). Fine for local/single-tenant \
+             use; do not run this in production without a control plane."
+        );
+        None
+    };
     let extractor = extractor_from_config(&config.extractor)?;
-    let app = router(AppState { pool, extractor });
+    let auth = Arc::new(Auth::from_config(&config.auth)?);
+    let workspaces = WorkspaceRegistry::new(config.data_dir.clone(), config.database_url.clone());
+    let app = router(AppState {
+        extractor,
+        control,
+        workspaces,
+        auth,
+        query_max_rows: config.query_max_rows,
+        query_timeout_ms: config.query_timeout_ms,
+    });
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
     axum::serve(listener, app)
@@ -51,19 +79,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
-    Ok(())
-}
-
-async fn seed_cmd(config: Config) -> anyhow::Result<()> {
-    let pool = db::connect(&config.database_url).await?;
-    let summary = seed::run(&pool).await?;
-    let mut conn = pool.acquire().await?;
-    target_profiles::seed_default(&mut conn, config.lead_min_fit_score).await?;
-    tracing::info!(
-        opportunities = summary.opportunities,
-        database = %config.database_url,
-        "seeded"
-    );
     Ok(())
 }
 
@@ -90,6 +105,60 @@ fn parse_flags(args: &[String]) -> Flags<'_> {
     Flags { positional, named }
 }
 
+fn workspace_id_flag(flags: &Flags<'_>) -> anyhow::Result<Uuid> {
+    flags.named.get("workspace").map_or_else(
+        || Ok(config::DEFAULT_WORKSPACE_ID),
+        |v| {
+            v.parse()
+                .map_err(|e| anyhow::anyhow!("--workspace is not a uuid: {e}"))
+        },
+    )
+}
+
+async fn workspace_pool(config: &Config, workspace_id: Uuid) -> anyhow::Result<SqlitePool> {
+    let registry = WorkspaceRegistry::new(config.data_dir.clone(), config.database_url.clone());
+    registry.get_or_create(workspace_id).await
+}
+
+async fn seed_cmd(config: Config, flags: Flags<'_>) -> anyhow::Result<()> {
+    // An explicit --workspace seeds just that workspace's SQLite data and
+    // skips the control-plane dev-user/workspace/app bootstrap below, which
+    // only makes sense for the one workspace this command discovers or
+    // creates on its own.
+    let explicit_workspace = flags.named.contains_key("workspace");
+    let control_pool = match &config.control_database_url {
+        Some(url) if !explicit_workspace => Some(control::connect(url).await?),
+        _ => None,
+    };
+
+    let workspace_id = if let Some(control) = &control_pool {
+        seed::ensure_dev_workspace(control).await?
+    } else {
+        workspace_id_flag(&flags)?
+    };
+
+    let pool = workspace_pool(&config, workspace_id).await?;
+    let summary = seed::run(&pool).await?;
+    let mut conn = pool.acquire().await?;
+    target_profiles::seed_default(&mut conn, config.lead_min_fit_score).await?;
+    drop(conn);
+    tracing::info!(
+        opportunities = summary.opportunities,
+        %workspace_id,
+        "seeded sqlite data"
+    );
+
+    if let Some(control) = &control_pool {
+        seed::seed_control_plane(control, workspace_id).await?;
+        tracing::info!(%workspace_id, "seeded control plane: workspace, saved queries, sales app");
+    } else if config.control_database_url.is_some() {
+        tracing::info!("--workspace given; skipped the control-plane dev-user/app bootstrap");
+    } else {
+        tracing::info!("CONTROL_DATABASE_URL not set; skipped the control-plane bootstrap");
+    }
+    Ok(())
+}
+
 async fn import_cmd(config: Config, args: &[String]) -> anyhow::Result<()> {
     let flags = parse_flags(args.get(1..).unwrap_or_default());
     match args.first().map(String::as_str) {
@@ -98,18 +167,20 @@ async fn import_cmd(config: Config, args: &[String]) -> anyhow::Result<()> {
         Some(other) => {
             bail!("unknown import source `{other}`; expected `bizapedia` or `il-sos-llc`")
         }
-        None => bail!("usage: import <bizapedia|il-sos-llc> <path> [--mapping <file>]"),
+        None => bail!(
+            "usage: import <bizapedia|il-sos-llc> <path> [--mapping <file>] [--workspace <uuid>]"
+        ),
     }
 }
 
 async fn import_bizapedia(config: Config, flags: &Flags<'_>) -> anyhow::Result<()> {
     let Some(&csv_path) = flags.positional.first() else {
-        bail!("usage: import bizapedia <path.csv> [--mapping <file>]");
+        bail!("usage: import bizapedia <path.csv> [--mapping <file>] [--workspace <uuid>]");
     };
     let mapping_path: Option<PathBuf> = flags.named.get("mapping").map(PathBuf::from);
     let mapping = ColumnMapping::load(mapping_path.as_deref())?;
 
-    let pool = db::connect(&config.database_url).await?;
+    let pool = workspace_pool(&config, workspace_id_flag(flags)?).await?;
     let bucket = Bucket::new(&config.bucket_dir);
     let mut conn = pool.acquire().await?;
     let profile = target_profiles::first(&mut conn).await?;
@@ -136,10 +207,10 @@ async fn import_bizapedia(config: Config, flags: &Flags<'_>) -> anyhow::Result<(
 
 async fn import_il_sos_llc(config: Config, flags: &Flags<'_>) -> anyhow::Result<()> {
     let Some(&master_path) = flags.positional.first() else {
-        bail!("usage: import il-sos-llc <path to llcallmst.txt>");
+        bail!("usage: import il-sos-llc <path to llcallmst.txt> [--workspace <uuid>]");
     };
 
-    let pool = db::connect(&config.database_url).await?;
+    let pool = workspace_pool(&config, workspace_id_flag(flags)?).await?;
     let bucket = Bucket::new(&config.bucket_dir);
     let mut conn = pool.acquire().await?;
     let profile = target_profiles::first(&mut conn).await?;
@@ -172,7 +243,7 @@ fn limit_flag(flags: &Flags<'_>) -> anyhow::Result<i64> {
 
 async fn enrich_cmd(config: Config, flags: Flags<'_>) -> anyhow::Result<()> {
     let limit = limit_flag(&flags)?;
-    let pool = db::connect(&config.database_url).await?;
+    let pool = workspace_pool(&config, workspace_id_flag(&flags)?).await?;
     let bucket = Bucket::new(&config.bucket_dir);
     let places = places_from_config(&config.places)?;
     let fetcher = fetcher_from_config(config.crawler, &config.crawl_limits)?;
@@ -200,7 +271,7 @@ async fn enrich_cmd(config: Config, flags: Flags<'_>) -> anyhow::Result<()> {
 
 async fn classify_cmd(config: Config, flags: Flags<'_>) -> anyhow::Result<()> {
     let limit = limit_flag(&flags)?;
-    let pool = db::connect(&config.database_url).await?;
+    let pool = workspace_pool(&config, workspace_id_flag(&flags)?).await?;
     let classifier = classifier_from_config(&config.classifier)?;
     let mut conn = pool.acquire().await?;
     let Some(profile) = target_profiles::first(&mut conn).await? else {

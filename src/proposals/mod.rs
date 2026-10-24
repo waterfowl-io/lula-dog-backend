@@ -5,15 +5,14 @@
 //! through `apply` and leave a `field_changes` row behind.
 
 use axum::Json;
-use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqliteConnection};
 use utoipa::ToSchema;
 
-use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::extract::ApiPath;
+use crate::extract::{ApiPath, IdPath};
 use crate::opportunities::{self, Opportunity, OpportunityView, Stage};
+use crate::workspace_db::WorkspaceContext;
 
 /// An opportunity field that a change can target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
@@ -278,8 +277,8 @@ pub struct AcceptResponse {
 /// Accept a proposal and apply its value to the opportunity.
 #[utoipa::path(
     post,
-    path = "/proposals/{id}/accept",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/proposals/{id}/accept",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = AcceptResponse),
         (status = 404, body = crate::error::ErrorBody),
@@ -288,10 +287,10 @@ pub struct AcceptResponse {
     tag = "proposals"
 )]
 pub async fn accept(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<AcceptResponse>> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = ws.pool.begin().await?;
     let proposal = accept_one(&mut tx, id).await?;
     let opportunity = opportunities::fetch_view(&mut tx, proposal.opportunity_id).await?;
     tx.commit().await?;
@@ -304,8 +303,8 @@ pub async fn accept(
 /// Reject a proposal. The opportunity is unchanged.
 #[utoipa::path(
     post,
-    path = "/proposals/{id}/reject",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/proposals/{id}/reject",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = FieldChange),
         (status = 404, body = crate::error::ErrorBody),
@@ -314,10 +313,10 @@ pub async fn accept(
     tag = "proposals"
 )]
 pub async fn reject(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<FieldChange>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     Ok(Json(resolve(&mut conn, id, ChangeStatus::Rejected).await?))
 }
 
@@ -332,8 +331,8 @@ pub struct AcceptAllResponse {
 /// Accept every pending proposal on an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities/{id}/proposals/accept-all",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}/proposals/accept-all",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = AcceptAllResponse),
         (status = 404, body = crate::error::ErrorBody),
@@ -341,10 +340,10 @@ pub struct AcceptAllResponse {
     tag = "proposals"
 )]
 pub async fn accept_all(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<AcceptAllResponse>> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = ws.pool.begin().await?;
     opportunities::fetch(&mut tx, id).await?;
     let mut accepted = Vec::new();
     for pending in pending_for(&mut tx, id).await? {
@@ -366,8 +365,8 @@ pub struct DismissAllResponse {
 /// Reject every pending proposal on an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities/{id}/proposals/dismiss-all",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}/proposals/dismiss-all",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = DismissAllResponse),
         (status = 404, body = crate::error::ErrorBody),
@@ -375,10 +374,10 @@ pub struct DismissAllResponse {
     tag = "proposals"
 )]
 pub async fn dismiss_all(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<DismissAllResponse>> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = ws.pool.begin().await?;
     opportunities::fetch(&mut tx, id).await?;
     let rejected = sqlx::query_as::<_, FieldChange>(
         "UPDATE field_changes SET status = 'rejected'
