@@ -246,6 +246,7 @@ pub async fn accept(
             stage: Some(Stage::Lead),
             next_step: None,
             last_touch_at: None,
+            product: None,
         },
     )
     .await?;

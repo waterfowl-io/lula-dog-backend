@@ -27,7 +27,11 @@ or dates.
 - latest_date: the date of the most recent message or event in the text, \
 ISO 8601. Resolve relative dates against `today`.
 - tasks: concrete follow-ups for the salesperson, with an ISO 8601 due date \
-when one is stated or clearly implied.";
+when one is stated or clearly implied.
+- evidence: for each of company, contact_name, contact_email, value_cents, \
+stage and next_step that you set, quote the exact sentence or line from the \
+text that justifies it. Omit (null) a field's evidence if you did not set \
+that field, or if no single line supports it.";
 
 pub struct GrokExtractor {
     client: reqwest::Client,
@@ -104,10 +108,26 @@ fn schema() -> Value {
                     "required": ["title", "due_at"],
                 },
             },
+            "evidence": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "company": nullable_string,
+                    "contact_name": nullable_string,
+                    "contact_email": nullable_string,
+                    "value_cents": nullable_string,
+                    "stage": nullable_string,
+                    "next_step": nullable_string,
+                },
+                "required": [
+                    "company", "contact_name", "contact_email", "value_cents",
+                    "stage", "next_step",
+                ],
+            },
         },
         "required": [
             "summary", "company", "contact_name", "contact_email", "value_cents",
-            "stage", "next_step", "latest_date", "tasks",
+            "stage", "next_step", "latest_date", "tasks", "evidence",
         ],
     })
 }

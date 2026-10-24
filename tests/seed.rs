@@ -111,6 +111,7 @@ async fn backfills_leads_into_an_existing_database_missing_them() {
             stage: Some(lula_dog_backend::opportunities::Stage::Lead),
             next_step: None,
             last_touch_at: None,
+            product: None,
         },
     )
     .await

@@ -61,6 +61,9 @@ pub struct Opportunity {
     pub stage: Stage,
     pub next_step: Option<String>,
     pub last_touch_at: Option<String>,
+    /// A one-line product description for display (e.g. the kanban card
+    /// subtitle). Not part of the proposal/audit-trail system.
+    pub product: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -190,6 +193,12 @@ pub struct NewOpportunity {
     pub next_step: Option<String>,
     /// Any timestamp `time::normalize` accepts; stored as `YYYY-MM-DD HH:MM:SS` UTC.
     pub last_touch_at: Option<String>,
+    /// A one-line product description, shown on the kanban card. Not part
+    /// of the proposal/audit-trail system, so it isn't validated like the
+    /// other fields; absent for requests (like `opportunity.create`) that
+    /// don't collect it.
+    #[serde(default)]
+    pub product: Option<String>,
 }
 
 /// Validate and insert. The one writer of new opportunity rows; the seed
@@ -209,8 +218,8 @@ pub async fn insert(conn: &mut SqliteConnection, new: NewOpportunity) -> AppResu
     let stage = new.stage.unwrap_or(Stage::Lead);
     Ok(sqlx::query_as::<_, Opportunity>(
         "INSERT INTO opportunities
-           (company, contact_name, contact_email, value_cents, stage, next_step, last_touch_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           (company, contact_name, contact_email, value_cents, stage, next_step, last_touch_at, product)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          RETURNING *",
     )
     .bind(company)
@@ -220,6 +229,7 @@ pub async fn insert(conn: &mut SqliteConnection, new: NewOpportunity) -> AppResu
     .bind(stage)
     .bind(next_step)
     .bind(last_touch_at)
+    .bind(new.product)
     .fetch_one(conn)
     .await?)
 }
@@ -386,7 +396,7 @@ pub async fn patch(
     let mut current = fetch(&mut tx, id).await?;
     for (field, value) in patch.changes() {
         let value = norm(field, value.as_deref())?;
-        proposals::set_field(&mut tx, &current, field, value.as_deref(), None).await?;
+        proposals::set_field(&mut tx, &current, field, value.as_deref(), None, None).await?;
         current = fetch(&mut tx, id).await?;
     }
     let view = fetch_view(&mut tx, id).await?;

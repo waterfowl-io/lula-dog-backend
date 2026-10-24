@@ -12,6 +12,7 @@ use utoipa::ToSchema;
 use crate::error::{AppError, AppResult};
 use crate::extract::{ApiPath, IdPath};
 use crate::opportunities::{self, Opportunity, OpportunityView, Stage};
+use crate::timeline;
 use crate::workspace_db::WorkspaceContext;
 
 /// An opportunity field that a change can target.
@@ -107,6 +108,11 @@ pub struct FieldChange {
     pub old_value: Option<String>,
     pub new_value: Option<String>,
     pub status: ChangeStatus,
+    /// The quote from the source text the extractor based this on, when it
+    /// found one (e.g. `"Could you also quote SKU 3 in 32 ECT?"`). `null`
+    /// for direct edits and for fields the extractor set with no single
+    /// quotable line.
+    pub evidence: Option<String>,
     pub created_at: String,
 }
 
@@ -116,12 +122,13 @@ async fn record(
     field: Field,
     new_value: Option<&str>,
     entry_id: Option<i64>,
+    evidence: Option<&str>,
     status: ChangeStatus,
 ) -> AppResult<FieldChange> {
     Ok(sqlx::query_as::<_, FieldChange>(
         "INSERT INTO field_changes
-           (opportunity_id, entry_id, field, old_value, new_value, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+           (opportunity_id, entry_id, field, old_value, new_value, status, evidence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          RETURNING *",
     )
     .bind(opportunity.id)
@@ -130,6 +137,7 @@ async fn record(
     .bind(opportunity.get(field))
     .bind(new_value)
     .bind(status)
+    .bind(evidence)
     .fetch_one(conn)
     .await?)
 }
@@ -163,6 +171,7 @@ pub async fn set_field(
     field: Field,
     value: Option<&str>,
     entry_id: Option<i64>,
+    evidence: Option<&str>,
 ) -> AppResult<Option<FieldChange>> {
     if opportunity.get(field).as_deref() == value {
         return Ok(None);
@@ -174,6 +183,7 @@ pub async fn set_field(
         field,
         value,
         entry_id,
+        evidence,
         ChangeStatus::Accepted,
     )
     .await?;
@@ -189,6 +199,7 @@ pub async fn propose(
     field: Field,
     value: &str,
     entry_id: Option<i64>,
+    evidence: Option<&str>,
 ) -> AppResult<Option<FieldChange>> {
     if opportunity.get(field).as_deref() == Some(value) {
         return Ok(None);
@@ -211,6 +222,7 @@ pub async fn propose(
         field,
         Some(value),
         entry_id,
+        evidence,
         ChangeStatus::Proposed,
     )
     .await?;
@@ -254,6 +266,38 @@ async fn resolve(conn: &mut SqliteConnection, id: i64, to: ChangeStatus) -> AppR
     Err(existing.map_or(AppError::NotFound("proposal"), |status| {
         AppError::Conflict(format!("proposal {id} is already {}", status.as_str()))
     }))
+}
+
+/// Write one timeline note per source entry for a batch of just-rejected
+/// changes, e.g. "Dismissed 2 suggestions from Re: Double-wall 24x18x18
+/// proposal" -- so dismissing leaves a record, not silence.
+async fn write_dismissal_notes(
+    conn: &mut SqliteConnection,
+    opportunity_id: i64,
+    rejected: &[FieldChange],
+) -> AppResult<()> {
+    let mut by_entry: std::collections::BTreeMap<Option<i64>, usize> =
+        std::collections::BTreeMap::new();
+    for change in rejected {
+        *by_entry.entry(change.entry_id).or_insert(0) += 1;
+    }
+    for (entry_id, count) in by_entry {
+        let noun = if count == 1 {
+            "suggestion"
+        } else {
+            "suggestions"
+        };
+        let source = match entry_id {
+            Some(id) => timeline::summary_or_raw(conn, id).await?,
+            None => None,
+        };
+        let note = source.map_or_else(
+            || format!("Dismissed {count} {noun}"),
+            |summary| format!("Dismissed {count} {noun} from {summary}"),
+        );
+        timeline::insert(conn, opportunity_id, &note).await?;
+    }
+    Ok(())
 }
 
 async fn accept_one(conn: &mut SqliteConnection, id: i64) -> AppResult<FieldChange> {
@@ -316,8 +360,112 @@ pub async fn reject(
     ws: WorkspaceContext,
     ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<FieldChange>> {
+    let mut tx = ws.pool.begin().await?;
+    let change = resolve(&mut tx, id, ChangeStatus::Rejected).await?;
+    write_dismissal_notes(
+        &mut tx,
+        change.opportunity_id,
+        std::slice::from_ref(&change),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(change))
+}
+
+/// Undo a just-rejected proposal within the frontend's short "Undo" window,
+/// putting it back to `proposed`. Refuses (409) once something else has
+/// resolved it again, so it can never resurrect a stale decision.
+#[utoipa::path(
+    post,
+    path = "/w/{workspace_id}/proposals/{id}/unreject",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
+    responses(
+        (status = 200, body = FieldChange),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 409, description = "No longer rejected", body = crate::error::ErrorBody),
+    ),
+    tag = "proposals"
+)]
+pub async fn unreject(
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
+) -> AppResult<Json<FieldChange>> {
     let mut conn = ws.pool.acquire().await?;
-    Ok(Json(resolve(&mut conn, id, ChangeStatus::Rejected).await?))
+    let claimed = sqlx::query_as::<_, FieldChange>(
+        "UPDATE field_changes SET status = 'proposed'
+         WHERE id = ?1 AND status = 'rejected'
+         RETURNING *",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(change) = claimed {
+        return Ok(Json(change));
+    }
+    let existing: Option<ChangeStatus> =
+        sqlx::query_scalar("SELECT status FROM field_changes WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Err(existing.map_or(AppError::NotFound("proposal"), |status| {
+        AppError::Conflict(format!(
+            "proposal {id} is no longer rejected (now {})",
+            status.as_str()
+        ))
+    }))
+}
+
+/// Undo a just-accepted proposal within the frontend's short "Undo" window:
+/// puts the field back to `old_value` and the change back to `proposed`.
+/// Refuses (409) if the opportunity's field no longer holds the value this
+/// change applied -- something else changed it since, so undoing here would
+/// clobber that instead of this accept.
+#[utoipa::path(
+    post,
+    path = "/w/{workspace_id}/proposals/{id}/unaccept",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
+    responses(
+        (status = 200, body = FieldChange),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 409, description = "Not accepted, or changed again since", body = crate::error::ErrorBody),
+    ),
+    tag = "proposals"
+)]
+pub async fn unaccept(
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
+) -> AppResult<Json<FieldChange>> {
+    let mut tx = ws.pool.begin().await?;
+    let change: FieldChange = sqlx::query_as("SELECT * FROM field_changes WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound("proposal"))?;
+    if change.status != ChangeStatus::Accepted {
+        return Err(AppError::Conflict(format!("proposal {id} is not accepted")));
+    }
+    let opportunity = opportunities::fetch(&mut tx, change.opportunity_id).await?;
+    if opportunity.get(change.field).as_deref() != change.new_value.as_deref() {
+        return Err(AppError::Conflict(format!(
+            "proposal {id} can't be undone: the field changed again since it was accepted"
+        )));
+    }
+    apply(
+        &mut tx,
+        change.opportunity_id,
+        change.field,
+        change.old_value.as_deref(),
+    )
+    .await?;
+    let reverted = sqlx::query_as::<_, FieldChange>(
+        "UPDATE field_changes SET status = 'proposed' WHERE id = ?1 AND status = 'accepted' RETURNING *",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::Conflict(format!("proposal {id} is no longer accepted")))?;
+    tx.commit().await?;
+    Ok(Json(reverted))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -387,6 +535,7 @@ pub async fn dismiss_all(
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
+    write_dismissal_notes(&mut tx, id, &rejected).await?;
     tx.commit().await?;
     Ok(Json(DismissAllResponse { rejected }))
 }

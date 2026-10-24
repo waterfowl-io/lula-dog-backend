@@ -68,3 +68,15 @@ pub async fn list_for(
     .fetch_all(conn)
     .await?)
 }
+
+/// An entry's `summary`, falling back to its `raw_text` when the extractor
+/// didn't set one. Used for "from {this}" references elsewhere in the
+/// timeline (e.g. a dismissal note), so they read like the entry they cite.
+pub async fn summary_or_raw(conn: &mut SqliteConnection, id: i64) -> AppResult<Option<String>> {
+    let row: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT summary, raw_text FROM timeline_entries WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(conn)
+            .await?;
+    Ok(row.map(|(summary, raw_text)| summary.unwrap_or(raw_text)))
+}

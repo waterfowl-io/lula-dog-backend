@@ -126,7 +126,7 @@ async fn write_results(
     conn: &mut SqliteConnection,
     opportunity_id: i64,
     entry: TimelineEntry,
-    extraction: Extraction,
+    mut extraction: Extraction,
 ) -> AppResult<PasteResponse> {
     let latest_date = extraction
         .latest_date
@@ -141,34 +141,8 @@ async fn write_results(
     )
     .await?;
 
-    let mut proposals = Vec::new();
-    let mut auto_filled = Vec::new();
-    for (field, raw) in [
-        (Field::Company, extraction.company),
-        (Field::ContactName, extraction.contact_name),
-        (Field::ContactEmail, extraction.contact_email),
-        (
-            Field::ValueCents,
-            extraction.value_cents.map(|v| v.to_string()),
-        ),
-        (Field::Stage, extraction.stage),
-        (Field::NextStep, extraction.next_step),
-    ] {
-        // Untrusted output: anything that does not normalize is dropped.
-        let Ok(Some(value)) = field.normalize(raw.as_deref()) else {
-            continue;
-        };
-        // Re-read each time: an earlier auto-fill changed the row.
-        let current = opportunities::fetch(conn, opportunity_id).await?;
-        if current.get(field).is_none() {
-            auto_filled.extend(
-                proposals::set_field(conn, &current, field, Some(&value), Some(entry.id)).await?,
-            );
-        } else {
-            proposals
-                .extend(proposals::propose(conn, &current, field, &value, Some(entry.id)).await?);
-        }
-    }
+    let (proposals, mut auto_filled) =
+        apply_extracted_fields(conn, opportunity_id, entry.id, &mut extraction).await?;
 
     if let Some(latest) = latest_date {
         let current = opportunities::fetch(conn, opportunity_id).await?;
@@ -180,6 +154,7 @@ async fn write_results(
                     Field::LastTouchAt,
                     Some(&latest),
                     Some(entry.id),
+                    None,
                 )
                 .await?,
             );
@@ -212,6 +187,79 @@ async fn write_results(
         suggested_tasks,
         extraction_error: None,
     })
+}
+
+/// Apply every field the extractor found, each with its evidence quote
+/// (when there is one): an empty field is filled in and recorded as an
+/// accepted change, one that already has a different value only gets a
+/// proposal. Takes each field (and its evidence) out of `extraction`,
+/// leaving `tasks` and the rest for the caller.
+async fn apply_extracted_fields(
+    conn: &mut SqliteConnection,
+    opportunity_id: i64,
+    entry_id: i64,
+    extraction: &mut Extraction,
+) -> AppResult<(Vec<FieldChange>, Vec<FieldChange>)> {
+    let evidence = std::mem::take(&mut extraction.evidence);
+    let mut proposals = Vec::new();
+    let mut auto_filled = Vec::new();
+    for (field, raw, field_evidence) in [
+        (Field::Company, extraction.company.take(), evidence.company),
+        (
+            Field::ContactName,
+            extraction.contact_name.take(),
+            evidence.contact_name,
+        ),
+        (
+            Field::ContactEmail,
+            extraction.contact_email.take(),
+            evidence.contact_email,
+        ),
+        (
+            Field::ValueCents,
+            extraction.value_cents.take().map(|v| v.to_string()),
+            evidence.value_cents,
+        ),
+        (Field::Stage, extraction.stage.take(), evidence.stage),
+        (
+            Field::NextStep,
+            extraction.next_step.take(),
+            evidence.next_step,
+        ),
+    ] {
+        // Untrusted output: anything that does not normalize is dropped.
+        let Ok(Some(value)) = field.normalize(raw.as_deref()) else {
+            continue;
+        };
+        // Re-read each time: an earlier auto-fill changed the row.
+        let current = opportunities::fetch(conn, opportunity_id).await?;
+        if current.get(field).is_none() {
+            auto_filled.extend(
+                proposals::set_field(
+                    conn,
+                    &current,
+                    field,
+                    Some(&value),
+                    Some(entry_id),
+                    field_evidence.as_deref(),
+                )
+                .await?,
+            );
+        } else {
+            proposals.extend(
+                proposals::propose(
+                    conn,
+                    &current,
+                    field,
+                    &value,
+                    Some(entry_id),
+                    field_evidence.as_deref(),
+                )
+                .await?,
+            );
+        }
+    }
+    Ok((proposals, auto_filled))
 }
 
 fn is_newer(opportunity: &Opportunity, candidate: &str) -> bool {

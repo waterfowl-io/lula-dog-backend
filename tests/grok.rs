@@ -53,6 +53,7 @@ fn opportunity() -> Opportunity {
         stage: Stage::Qualified,
         next_step: None,
         last_touch_at: None,
+        product: None,
         created_at: "2026-10-01 00:00:00".to_owned(),
         updated_at: "2026-10-01 00:00:00".to_owned(),
     }
@@ -117,7 +118,7 @@ async fn sends_a_structured_output_request_and_parses_the_reply() {
     assert_eq!(body["response_format"]["json_schema"]["strict"], true);
     let schema = &body["response_format"]["json_schema"]["schema"];
     assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["required"].as_array().unwrap().len(), 9);
+    assert_eq!(schema["required"].as_array().unwrap().len(), 10);
     let user: Value =
         serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(user["today"], "2026-10-23");

@@ -37,6 +37,7 @@ pub fn extract(text: &str) -> Extraction {
     let mut first_body_line = None;
     let mut latest_header: Option<String> = None;
     let mut latest_token: Option<String> = None;
+    let mut stage: Option<&'static str> = None;
 
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         if let Some(v) = after_prefix(line, "subject:") {
@@ -46,11 +47,21 @@ pub fn extract(text: &str) -> Extraction {
                 let (name, email) = parse_from(v);
                 out.contact_name = name;
                 out.contact_email = email;
+                if out.contact_name.is_some() || out.contact_email.is_some() {
+                    out.evidence.contact_name = Some(line.to_owned());
+                    out.evidence.contact_email = Some(line.to_owned());
+                }
             }
         } else if let Some(v) = after_prefix(line, "company:") {
-            out.company.get_or_insert_with(|| v.to_owned());
+            if out.company.is_none() {
+                out.company = Some(v.to_owned());
+                out.evidence.company = Some(line.to_owned());
+            }
         } else if let Some(v) = after_prefix(line, "next step:") {
-            out.next_step.get_or_insert_with(|| v.to_owned());
+            if out.next_step.is_none() {
+                out.next_step = Some(v.to_owned());
+                out.evidence.next_step = Some(line.to_owned());
+            }
         } else if let Some(v) = after_prefix(line, "todo:") {
             out.tasks.push(parse_todo(v));
         } else if let Some(v) = after_prefix(line, "date:") {
@@ -61,6 +72,13 @@ pub fn extract(text: &str) -> Extraction {
             first_body_line = Some(line.to_owned());
         }
 
+        if stage.is_none()
+            && let Some(s) = stage_from_keywords(&line.to_lowercase())
+        {
+            stage = Some(s);
+            out.evidence.stage = Some(line.to_owned());
+        }
+
         for token in line.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')') {
             let token = token.trim_end_matches(['.', ';', ':', '?', '!']);
             if token.len() == 10
@@ -69,15 +87,18 @@ pub fn extract(text: &str) -> Extraction {
                 latest_token = Some(max_date(latest_token, d));
             }
         }
-        if out.value_cents.is_none() {
-            out.value_cents = parse_money(line);
+        if out.value_cents.is_none()
+            && let Some(cents) = parse_money(line)
+        {
+            out.value_cents = Some(cents);
+            out.evidence.value_cents = Some(line.to_owned());
         }
     }
 
     out.summary = subject
         .or(first_body_line)
         .map(|s| s.chars().take(SUMMARY_MAX_CHARS).collect());
-    out.stage = stage_from_keywords(&text.to_lowercase()).map(str::to_owned);
+    out.stage = stage.map(str::to_owned);
     out.latest_date = latest_header.or(latest_token);
     out
 }
@@ -219,6 +240,31 @@ TODO: Call Dana about pallet count
                 },
             ]
         );
+    }
+
+    #[test]
+    fn captures_an_evidence_quote_per_field_it_sets() {
+        let got = extract(THREAD);
+        assert_eq!(
+            got.evidence.contact_name.as_deref(),
+            Some("From: Dana Ortiz <dana@example.com>")
+        );
+        assert_eq!(got.evidence.contact_name, got.evidence.contact_email);
+        assert_eq!(
+            got.evidence.value_cents.as_deref(),
+            Some("Thanks for the quote. Pricing at $12,450.00 for 5,000 units works.")
+        );
+        assert_eq!(
+            got.evidence.stage.as_deref(),
+            Some("Subject: Re: 12x10x8 RSC quote")
+        );
+        assert_eq!(
+            got.evidence.next_step.as_deref(),
+            Some("Next step: Send revised quote with double-wall option")
+        );
+        // No `Company:` line in the thread, so no company evidence either.
+        assert_eq!(got.company, None);
+        assert_eq!(got.evidence.company, None);
     }
 
     #[test]

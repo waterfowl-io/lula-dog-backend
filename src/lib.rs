@@ -150,6 +150,8 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/{id}", patch(tasks::patch).delete(tasks::delete))
         .route("/proposals/{id}/accept", post(proposals::accept))
         .route("/proposals/{id}/reject", post(proposals::reject))
+        .route("/proposals/{id}/unaccept", post(proposals::unaccept))
+        .route("/proposals/{id}/unreject", post(proposals::unreject))
         .route("/alerts/stale", get(alerts::stale))
         .route(
             "/target-profiles",
@@ -243,6 +245,8 @@ pub async fn health(State(state): State<AppState>) -> AppResult<Json<Health>> {
         paste::paste,
         proposals::accept,
         proposals::reject,
+        proposals::unaccept,
+        proposals::unreject,
         proposals::accept_all,
         proposals::dismiss_all,
         alerts::stale,
