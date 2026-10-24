@@ -18,6 +18,9 @@ pub struct TimelineEntry {
     pub summary: Option<String>,
     /// The latest date found in the text, `YYYY-MM-DD HH:MM:SS` UTC.
     pub occurred_at: Option<String>,
+    /// What kind of contact this was (N4): `"email"`, `"call"`, `"quote"`,
+    /// or `None` ("Note" in the UI).
+    pub kind: Option<String>,
     pub created_at: String,
 }
 
@@ -36,21 +39,26 @@ pub async fn insert(
 }
 
 /// Fill the enrichment columns. Only NULL columns are written (the trigger
-/// would refuse anything else), so a second call is a no-op.
+/// would refuse `summary`/`occurred_at` otherwise, and `kind` follows the
+/// same once-only convention even though the trigger doesn't enforce it),
+/// so a second call is a no-op.
 pub async fn enrich(
     conn: &mut SqliteConnection,
     id: i64,
     summary: Option<&str>,
     occurred_at: Option<&str>,
+    kind: Option<&str>,
 ) -> AppResult<TimelineEntry> {
     Ok(sqlx::query_as::<_, TimelineEntry>(
         "UPDATE timeline_entries
-         SET summary = COALESCE(summary, ?1), occurred_at = COALESCE(occurred_at, ?2)
-         WHERE id = ?3
+         SET summary = COALESCE(summary, ?1), occurred_at = COALESCE(occurred_at, ?2),
+             kind = COALESCE(kind, ?3)
+         WHERE id = ?4
          RETURNING *",
     )
     .bind(summary)
     .bind(occurred_at)
+    .bind(kind)
     .bind(id)
     .fetch_one(conn)
     .await?)

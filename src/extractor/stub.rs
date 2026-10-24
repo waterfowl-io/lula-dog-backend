@@ -13,6 +13,9 @@
 //! - The first `$1,234.56` amount sets value_cents.
 //! - Stage keywords: "not moving forward" / "went with another" (lost),
 //!   "purchase order" / "po attached" (won), "quote" / "proposal" (proposal).
+//! - Kind (N4): a `From:`+`Subject:` header pair means `"email"`; else
+//!   "call"/"spoke"/"phone" means `"call"`; else "quote" (and "sent" or
+//!   "attached") means `"quote"`; otherwise left unset ("Note" in the UI).
 
 use async_trait::async_trait;
 
@@ -95,12 +98,30 @@ pub fn extract(text: &str) -> Extraction {
         }
     }
 
+    out.kind = detect_kind(text, subject.is_some());
     out.summary = subject
         .or(first_body_line)
         .map(|s| s.chars().take(SUMMARY_MAX_CHARS).collect());
     out.stage = stage.map(str::to_owned);
     out.latest_date = latest_header.or(latest_token);
     out
+}
+
+/// See the module doc's "Kind" bullet. `has_subject` disambiguates a call
+/// transcript that happens to mention "email" from an actual email thread --
+/// only a `From:`/`Subject:` pair counts as one.
+fn detect_kind(text: &str, has_subject: bool) -> Option<String> {
+    let lower = text.to_lowercase();
+    let has_from = lower.lines().any(|l| l.trim_start().starts_with("from:"));
+    if has_from && has_subject {
+        Some("email".to_owned())
+    } else if ["call", "spoke", "phone"].iter().any(|w| lower.contains(w)) {
+        Some("call".to_owned())
+    } else if lower.contains("quote") && (lower.contains("sent") || lower.contains("attached")) {
+        Some("quote".to_owned())
+    } else {
+        None
+    }
 }
 
 fn after_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
@@ -221,6 +242,7 @@ TODO: Call Dana about pallet count
             Some("Send revised quote with double-wall option")
         );
         assert_eq!(got.latest_date.as_deref(), Some("2026-10-14 16:30:00"));
+        assert_eq!(got.kind.as_deref(), Some("email"));
         assert_eq!(
             extract("Spoke 2026-10-02, follow up 2026-10-09.")
                 .latest_date
@@ -275,6 +297,30 @@ TODO: Call Dana about pallet count
         assert_eq!(got.value_cents, None);
         assert_eq!(got.latest_date, None);
         assert_eq!(got.tasks.len(), 0);
+    }
+
+    #[test]
+    fn detects_kind_from_headers_and_keywords() {
+        assert_eq!(extract(THREAD).kind.as_deref(), Some("email"));
+        assert_eq!(
+            extract("Called Dana to confirm pallet count; no changes.")
+                .kind
+                .as_deref(),
+            Some("call")
+        );
+        assert_eq!(
+            extract("Spoke with Dana by phone about the drop test.")
+                .kind
+                .as_deref(),
+            Some("call")
+        );
+        assert_eq!(
+            extract("Quote sent: $14,500 for 4,000 boxes, net 30.")
+                .kind
+                .as_deref(),
+            Some("quote")
+        );
+        assert_eq!(extract("just a note").kind, None);
     }
 
     #[test]

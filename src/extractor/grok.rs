@@ -26,6 +26,8 @@ or dates.
 - next_step: the next concrete action for the salesperson.
 - latest_date: the date of the most recent message or event in the text, \
 ISO 8601. Resolve relative dates against `today`.
+- kind: one of email, call, quote, describing what this text records; null \
+if it's unclear.
 - tasks: concrete follow-ups for the salesperson, with an ISO 8601 due date \
 when one is stated or clearly implied.
 - evidence: for each of company, contact_name, contact_email, value_cents, \
@@ -96,6 +98,10 @@ fn schema() -> Value {
             },
             "next_step": nullable_string,
             "latest_date": nullable_string,
+            "kind": {
+                "type": ["string", "null"],
+                "enum": ["email", "call", "quote", null],
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -127,7 +133,7 @@ fn schema() -> Value {
         },
         "required": [
             "summary", "company", "contact_name", "contact_email", "value_cents",
-            "stage", "next_step", "latest_date", "tasks", "evidence",
+            "stage", "next_step", "latest_date", "kind", "tasks", "evidence",
         ],
     })
 }

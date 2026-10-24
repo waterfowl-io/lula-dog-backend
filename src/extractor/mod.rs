@@ -39,6 +39,9 @@ pub struct Extraction {
     /// The most recent date in the thread, any format `time::normalize`
     /// accepts.
     pub latest_date: Option<String>,
+    /// What kind of contact this was: `"email"`, `"call"` or `"quote"`.
+    /// `None` when the text doesn't clearly say (shown as "Note").
+    pub kind: Option<String>,
     #[serde(default)]
     pub tasks: Vec<SuggestedTask>,
     /// The source quote behind each field above, when the extractor can

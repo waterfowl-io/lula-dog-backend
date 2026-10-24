@@ -138,6 +138,7 @@ async fn write_results(
         entry.id,
         extraction.summary.as_deref().map(str::trim),
         latest_date.as_deref(),
+        extraction.kind.as_deref(),
     )
     .await?;
 
