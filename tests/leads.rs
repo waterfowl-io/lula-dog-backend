@@ -235,3 +235,66 @@ async fn unknown_lead_is_404() {
     let (status, _) = app.post("/leads/999/reject", json!({"reason": "x"})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+async fn set_classification_industry(pool: &sqlx::SqlitePool, company_id: i64, industry: &str) {
+    sqlx::query(
+        "INSERT INTO company_enrichments (company_id, kind, result, status)
+         VALUES (?1, 'classify', ?2, 'ok')",
+    )
+    .bind(company_id)
+    .bind(
+        json!({
+            "industry": industry, "products": [], "ships_physical_goods": true,
+            "size_signals": [], "contact_page_url": null, "fit_score": 70,
+            "fit_reason": null,
+        })
+        .to_string(),
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn industry_filter_matches_the_latest_classification() {
+    let app = TestApp::new().await;
+    let profile = profile_id(&app.pool).await;
+    let coffee_id = queued_company(&app.pool, "Coffee Co", profile, 70).await;
+    let bakery_id = queued_company(&app.pool, "Bakery Co", profile, 70).await;
+    let coffee_company: i64 =
+        sqlx::query_scalar("SELECT company_id FROM lead_candidates WHERE id = ?1")
+            .bind(coffee_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    let bakery_company: i64 =
+        sqlx::query_scalar("SELECT company_id FROM lead_candidates WHERE id = ?1")
+            .bind(bakery_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    set_classification_industry(&app.pool, coffee_company, "coffee roaster").await;
+    set_classification_industry(&app.pool, bakery_company, "bakery").await;
+
+    let (status, body) = app.get("/leads?industry=coffee%20roaster").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let leads = body.as_array().unwrap();
+    assert_eq!(leads.len(), 1, "{body}");
+    assert_eq!(leads[0]["company"]["name"], "Coffee Co");
+    assert_eq!(leads[0]["classification"]["industry"], "coffee roaster");
+}
+
+#[tokio::test]
+async fn profile_id_filter_only_shows_leads_from_that_profile() {
+    let app = TestApp::new().await;
+    let profile_a = profile_id(&app.pool).await;
+    let profile_b = profile_id(&app.pool).await;
+    queued_company(&app.pool, "From A", profile_a, 70).await;
+    queued_company(&app.pool, "From B", profile_b, 70).await;
+
+    let (status, body) = app.get(&format!("/leads?profile_id={profile_a}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let leads = body.as_array().unwrap();
+    assert_eq!(leads.len(), 1);
+    assert_eq!(leads[0]["company"]["name"], "From A");
+}
