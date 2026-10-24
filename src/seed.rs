@@ -942,7 +942,7 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                         actions: actions_map(vec![]),
                         props: props(&[
                             ("value_field", json!("value")),
-                            ("caption", json!("no touch in 14+ days")),
+                            ("caption", json!("quiet 14+ days or task overdue")),
                             ("accent", json!(true)),
                         ]),
                     },

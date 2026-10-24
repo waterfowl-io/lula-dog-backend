@@ -161,7 +161,7 @@
           "action": null,
           "props": {
             "accent": true,
-            "caption": "no touch in 14+ days",
+            "caption": "quiet 14+ days or task overdue",
             "value_field": "value"
           }
         },
