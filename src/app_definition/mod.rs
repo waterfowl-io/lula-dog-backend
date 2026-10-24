@@ -26,6 +26,7 @@ use crate::error::{AppError, AppResult};
 /// existing endpoint on the backend.
 pub const KNOWN_ACTIONS: &[&str] = &[
     "opportunity.create",
+    "opportunity.update",
     "opportunity.update_stage",
     "paste.submit",
     "proposal.accept",

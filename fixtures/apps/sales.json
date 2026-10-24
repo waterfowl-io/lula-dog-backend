@@ -266,6 +266,33 @@
                 "label": "Company"
               },
               {
+                "badge_colors": {
+                  "lead": {
+                    "bg": "#F8F1E9",
+                    "dot": "#968D86",
+                    "text": "#6E6966"
+                  },
+                  "lost": {
+                    "bg": "#F8F1E9",
+                    "dot": "#968D86",
+                    "text": "#6E6966"
+                  },
+                  "proposal": {
+                    "bg": "#FCF0D6",
+                    "dot": "#E5A228",
+                    "text": "#8A5E0F"
+                  },
+                  "qualified": {
+                    "bg": "#E3EEFB",
+                    "dot": "#3F7FD6",
+                    "text": "#2A5DA6"
+                  },
+                  "won": {
+                    "bg": "#E3F3EA",
+                    "dot": "#2E9E6A",
+                    "text": "#1F7650"
+                  }
+                },
                 "format": "stage_pill",
                 "key": "stage",
                 "label": "Stage"
@@ -356,6 +383,10 @@
                   {
                     "type": "component",
                     "component_id": "deal_tasks"
+                  },
+                  {
+                    "type": "component",
+                    "component_id": "edit_deal_form"
                   }
                 ],
                 "width": "320px"
@@ -406,6 +437,12 @@
                 "icon": "check",
                 "label": "Move to Won",
                 "variant": "primary"
+              },
+              {
+                "form_id": "edit_deal_form",
+                "icon": "edit",
+                "label": "Edit",
+                "variant": "secondary"
               }
             ],
             "back_link": {
@@ -477,6 +514,33 @@
                 "label": "Value"
               },
               {
+                "badge_colors": {
+                  "lead": {
+                    "bg": "#F8F1E9",
+                    "dot": "#968D86",
+                    "text": "#6E6966"
+                  },
+                  "lost": {
+                    "bg": "#F8F1E9",
+                    "dot": "#968D86",
+                    "text": "#6E6966"
+                  },
+                  "proposal": {
+                    "bg": "#FCF0D6",
+                    "dot": "#E5A228",
+                    "text": "#8A5E0F"
+                  },
+                  "qualified": {
+                    "bg": "#E3EEFB",
+                    "dot": "#3F7FD6",
+                    "text": "#2A5DA6"
+                  },
+                  "won": {
+                    "bg": "#E3F3EA",
+                    "dot": "#2E9E6A",
+                    "text": "#1F7650"
+                  }
+                },
                 "format": "stage_pill",
                 "key": "stage",
                 "label": "Stage"
@@ -498,7 +562,57 @@
                 "key": "last_touch_at",
                 "label": "Last touch"
               }
+            ],
+            "menu": [
+              {
+                "form_id": "edit_deal_form",
+                "label": "Edit"
+              }
             ]
+          }
+        },
+        {
+          "id": "edit_deal_form",
+          "type": "form",
+          "title": "Edit deal",
+          "query": null,
+          "action": {
+            "action": "opportunity.update",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "props": {
+            "button_label": "Save",
+            "fields": [
+              {
+                "label": "Company",
+                "name": "company",
+                "required": true,
+                "type": "text"
+              },
+              {
+                "label": "Contact",
+                "name": "contact_name",
+                "type": "text"
+              },
+              {
+                "label": "Email",
+                "name": "contact_email",
+                "type": "text"
+              },
+              {
+                "label": "Value",
+                "name": "value_cents",
+                "type": "currency"
+              },
+              {
+                "label": "Next step",
+                "name": "next_step",
+                "type": "text"
+              }
+            ],
+            "hide_trigger": true
           }
         },
         {
@@ -515,7 +629,9 @@
           "props": {
             "item": {
               "date_field": "occurred_at",
+              "kind_field": "kind",
               "raw_field": "raw_text",
+              "suggestions_field": "suggestion_count",
               "summary_field": "summary"
             },
             "variant": "timeline"

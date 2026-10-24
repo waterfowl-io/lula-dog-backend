@@ -25,7 +25,7 @@ use crate::extractor::{Extractor, StubExtractor};
 use crate::leads;
 use crate::opportunities::{self, NewOpportunity, Stage};
 use crate::target_profiles;
-use crate::{app_definition, paste, tasks};
+use crate::{app_definition, paste, tasks, timeline};
 
 const DEV_USER_EMAIL: &str = "jack@lula.dog.example";
 const JACKS_WORKSPACE_NAME: &str = "Jack's Packaging";
@@ -286,6 +286,38 @@ async fn seed_opportunities(
             days_ago(1).to_rfc2822(),
             date(days_ago(-2)),
         ),
+    )
+    .await?;
+    // N4: an earlier call and quote on the same deal, so the timeline shows
+    // more than one `kind` (the email above, from the paste, is the
+    // newest and carries the pending proposal).
+    let summit_call = timeline::insert(
+        conn,
+        summit.id,
+        "Called Jordan Diaz to confirm specs before quoting. No pricing changes; \
+         sample approved after their drop test.",
+    )
+    .await?;
+    timeline::enrich(
+        conn,
+        summit_call.id,
+        Some("Confirmed specs by phone; sample approved"),
+        Some(&ts(days_ago(6))),
+        Some("call"),
+    )
+    .await?;
+    let summit_quote = timeline::insert(
+        conn,
+        summit.id,
+        "Sent quote: $14,500 for 4,000 double-wall 24x18x18 boxes, net 30.",
+    )
+    .await?;
+    timeline::enrich(
+        conn,
+        summit_quote.id,
+        Some("Quote sent: $14,500 for 4,000 boxes"),
+        Some(&ts(days_ago(12))),
+        Some("quote"),
     )
     .await?;
 
@@ -662,9 +694,17 @@ fn sales_saved_queries() -> Vec<NewSavedQuery> {
         NewSavedQuery {
             key: "deal_timeline".to_owned(),
             name: "Deal timeline".to_owned(),
-            description: Some("A deal's timeline entries, newest first.".to_owned()),
-            sql_text: "SELECT * FROM timeline_entries WHERE opportunity_id = :opportunity_id \
-                       ORDER BY created_at DESC"
+            description: Some(
+                "A deal's timeline entries, newest first, with how many pending \
+                 suggestions each one produced (N4)."
+                    .to_owned(),
+            ),
+            sql_text: "SELECT te.*, \
+                       (SELECT COUNT(*) FROM field_changes fc \
+                          WHERE fc.entry_id = te.id AND fc.status = 'proposed') \
+                         AS suggestion_count \
+                       FROM timeline_entries te WHERE te.opportunity_id = :opportunity_id \
+                       ORDER BY COALESCE(te.occurred_at, te.created_at) DESC, te.id DESC"
                 .to_owned(),
             params: opportunity_id_param.clone(),
         },
@@ -1015,7 +1055,7 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                                 "columns",
                                 json!([
                                     {"key": "company", "label": "Company"},
-                                    {"key": "stage", "label": "Stage", "format": "stage_pill"},
+                                    {"key": "stage", "label": "Stage", "format": "stage_pill", "badge_colors": badge_colors},
                                     {"key": "value_cents", "label": "Value", "format": "currency_cents"},
                                     {"key": "next_step", "label": "Next step"},
                                     {"key": "last_touch_at", "label": "Last touch", "format": "relative_date"},
@@ -1078,6 +1118,13 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                                     LayoutNode::Component {
                                         component_id: "deal_tasks".to_owned(),
                                     },
+                                    // N5: no visible trigger of its own
+                                    // (`hide_trigger`) -- opened by
+                                    // `deal_detail_view`'s Edit action and
+                                    // `deal_details_panel`'s menu.
+                                    LayoutNode::Component {
+                                        component_id: "edit_deal_form".to_owned(),
+                                    },
                                 ],
                                 Some("320px"),
                                 None,
@@ -1117,7 +1164,11 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                             ("title_field", json!("company")),
                             ("badge_field", json!("stage")),
                             ("badge_format", json!("stage_pill")),
-                            ("badge_colors", badge_colors),
+                            ("badge_colors", badge_colors.clone()),
+                            // (deal_details_panel, further below, reads
+                            // `badge_colors` once more via `json!`, which
+                            // only borrows it -- so this is the one real
+                            // clone the three uses need.)
                             (
                                 "meta",
                                 json!([
@@ -1133,6 +1184,16 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                                         "icon": "check",
                                         "variant": "primary",
                                         "action": {"action": "opportunity.update_stage", "params": {"stage": "won"}},
+                                    },
+                                    // N5: a secondary Edit beside Move to Won,
+                                    // opening the deal fields in a sheet
+                                    // (`edit_deal_form`) instead of mutating
+                                    // directly.
+                                    {
+                                        "label": "Edit",
+                                        "icon": "edit",
+                                        "variant": "secondary",
+                                        "form_id": "edit_deal_form",
                                     },
                                 ]),
                             ),
@@ -1154,11 +1215,43 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                                 "fields",
                                 json!([
                                     {"key": "value_cents", "label": "Value", "format": "currency_cents"},
-                                    {"key": "stage", "label": "Stage", "format": "stage_pill"},
+                                    {"key": "stage", "label": "Stage", "format": "stage_pill", "badge_colors": badge_colors},
                                     {"key": "next_step", "label": "Next step"},
                                     {"key": "contact_name", "label": "Contact"},
                                     {"key": "contact_email", "label": "Email"},
                                     {"key": "last_touch_at", "label": "Last touch", "format": "relative_date"},
+                                ]),
+                            ),
+                            // N5: the panel's "…" is now a real menu, not an
+                            // inert span -- its one item opens the same
+                            // edit sheet as the header's Edit action.
+                            (
+                                "menu",
+                                json!([{"label": "Edit", "form_id": "edit_deal_form"}]),
+                            ),
+                        ]),
+                    },
+                    Component {
+                        id: "edit_deal_form".to_owned(),
+                        kind: ComponentKind::Form,
+                        title: Some("Edit deal".to_owned()),
+                        query: None,
+                        action: Some(action_binding_with(
+                            "opportunity.update",
+                            &[("opportunity_id", "$route.opportunity_id")],
+                        )),
+                        actions: actions_map(vec![]),
+                        props: props(&[
+                            ("hide_trigger", json!(true)),
+                            ("button_label", json!("Save")),
+                            (
+                                "fields",
+                                json!([
+                                    {"name": "company", "type": "text", "label": "Company", "required": true},
+                                    {"name": "contact_name", "type": "text", "label": "Contact"},
+                                    {"name": "contact_email", "type": "text", "label": "Email"},
+                                    {"name": "value_cents", "type": "currency", "label": "Value"},
+                                    {"name": "next_step", "type": "text", "label": "Next step"},
                                 ]),
                             ),
                         ]),
@@ -1177,7 +1270,13 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                             ("variant", json!("timeline")),
                             (
                                 "item",
-                                json!({"raw_field": "raw_text", "summary_field": "summary", "date_field": "occurred_at"}),
+                                json!({
+                                    "raw_field": "raw_text",
+                                    "summary_field": "summary",
+                                    "date_field": "occurred_at",
+                                    "kind_field": "kind",
+                                    "suggestions_field": "suggestion_count",
+                                }),
                             ),
                         ]),
                     },
