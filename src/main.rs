@@ -7,7 +7,10 @@ use lula_dog_backend::bucket::Bucket;
 use lula_dog_backend::config::Config;
 use lula_dog_backend::importers::bizapedia::{self, ColumnMapping};
 use lula_dog_backend::importers::il_sos_llc;
-use lula_dog_backend::{AppState, db, extractor_from_config, router, seed, target_profiles};
+use lula_dog_backend::{
+    AppState, classifier_from_config, db, enrichment, extractor_from_config, fetcher_from_config,
+    places_from_config, router, seed, target_profiles,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -26,7 +29,13 @@ async fn main() -> anyhow::Result<()> {
         None | Some("serve") => serve(config).await,
         Some("seed") => seed_cmd(config).await,
         Some("import") => import_cmd(config, args.get(1..).unwrap_or_default()).await,
-        Some(other) => bail!("unknown command `{other}`; expected serve, seed or import"),
+        Some("enrich") => enrich_cmd(config, parse_flags(args.get(1..).unwrap_or_default())).await,
+        Some("classify") => {
+            classify_cmd(config, parse_flags(args.get(1..).unwrap_or_default())).await
+        }
+        Some(other) => {
+            bail!("unknown command `{other}`; expected serve, seed, import, enrich or classify")
+        }
     }
 }
 
@@ -145,6 +154,68 @@ async fn import_il_sos_llc(config: Config, flags: &Flags<'_>) -> anyhow::Result<
         filtered = summary.filtered,
         error = summary.error,
         "il-sos-llc import complete"
+    );
+    Ok(())
+}
+
+const DEFAULT_LIMIT: i64 = 50;
+
+fn limit_flag(flags: &Flags<'_>) -> anyhow::Result<i64> {
+    flags.named.get("limit").map_or_else(
+        || Ok(DEFAULT_LIMIT),
+        |v| {
+            v.parse()
+                .map_err(|e| anyhow::anyhow!("--limit is invalid: {e}"))
+        },
+    )
+}
+
+async fn enrich_cmd(config: Config, flags: Flags<'_>) -> anyhow::Result<()> {
+    let limit = limit_flag(&flags)?;
+    let pool = db::connect(&config.database_url).await?;
+    let bucket = Bucket::new(&config.bucket_dir);
+    let places = places_from_config(&config.places)?;
+    let fetcher = fetcher_from_config(config.crawler, &config.crawl_limits)?;
+
+    let summary = enrichment::run_enrich(
+        &pool,
+        &bucket,
+        &*places,
+        &*fetcher,
+        config.crawl_limits,
+        limit,
+    )
+    .await?;
+    tracing::info!(
+        places_attempted = summary.places.attempted,
+        places_success = summary.places.success,
+        places_error = summary.places.error,
+        crawl_attempted = summary.crawl.attempted,
+        crawl_success = summary.crawl.success,
+        crawl_error = summary.crawl.error,
+        "enrich complete"
+    );
+    Ok(())
+}
+
+async fn classify_cmd(config: Config, flags: Flags<'_>) -> anyhow::Result<()> {
+    let limit = limit_flag(&flags)?;
+    let pool = db::connect(&config.database_url).await?;
+    let classifier = classifier_from_config(&config.classifier)?;
+    let mut conn = pool.acquire().await?;
+    let Some(profile) = target_profiles::first(&mut conn).await? else {
+        bail!(
+            "classify requires a target profile; create one with POST /target-profiles or `cargo run -- seed` first"
+        );
+    };
+    drop(conn);
+
+    let summary = enrichment::run_classify(&pool, &*classifier, &profile, limit).await?;
+    tracing::info!(
+        attempted = summary.attempted,
+        success = summary.success,
+        error = summary.error,
+        "classify complete"
     );
     Ok(())
 }

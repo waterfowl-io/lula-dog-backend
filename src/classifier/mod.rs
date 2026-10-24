@@ -12,6 +12,7 @@ mod stub;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 pub use grok::GrokClassifier;
 pub use stub::StubClassifier;
@@ -31,7 +32,7 @@ pub struct ClassificationInput<'a> {
     pub contact_hint: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Classification {
     pub industry: Option<String>,

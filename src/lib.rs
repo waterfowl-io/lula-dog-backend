@@ -9,10 +9,12 @@ pub mod config;
 pub mod coverage;
 pub mod crawler;
 pub mod db;
+pub mod enrichment;
 pub mod error;
 pub mod extract;
 pub mod extractor;
 pub mod importers;
+pub mod leads;
 pub mod opportunities;
 pub mod paste;
 pub mod places;
@@ -32,9 +34,12 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use utoipa::{OpenApi, ToSchema};
 
-use crate::config::ExtractorConfig;
+use crate::classifier::{Classifier, GrokClassifier, StubClassifier};
+use crate::config::{ClassifierConfig, CrawlerConfig, ExtractorConfig, PlacesConfig};
+use crate::crawler::{Fetcher, HttpFetcher, StubFetcher};
 use crate::error::AppResult;
 use crate::extractor::{Extractor, GrokExtractor, StubExtractor};
+use crate::places::{GooglePlacesClient, PlacesClient, StubPlacesClient};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -50,6 +55,44 @@ pub fn extractor_from_config(config: &ExtractorConfig) -> anyhow::Result<Arc<dyn
             model,
             base_url,
         } => Arc::new(GrokExtractor::new(
+            api_key.clone(),
+            model.clone(),
+            base_url,
+        )?),
+    })
+}
+
+pub fn places_from_config(config: &PlacesConfig) -> anyhow::Result<Arc<dyn PlacesClient>> {
+    Ok(match config {
+        PlacesConfig::Stub => Arc::new(StubPlacesClient),
+        PlacesConfig::Google { api_key } => Arc::new(GooglePlacesClient::new(
+            api_key.clone(),
+            "https://places.googleapis.com/v1",
+        )?),
+    })
+}
+
+pub fn fetcher_from_config(
+    config: CrawlerConfig,
+    limits: &config::CrawlLimits,
+) -> anyhow::Result<Arc<dyn Fetcher>> {
+    Ok(match config {
+        CrawlerConfig::Stub => Arc::new(StubFetcher),
+        CrawlerConfig::Http => Arc::new(HttpFetcher::new(
+            std::time::Duration::from_secs(limits.timeout_secs),
+            limits.max_bytes,
+        )?),
+    })
+}
+
+pub fn classifier_from_config(config: &ClassifierConfig) -> anyhow::Result<Arc<dyn Classifier>> {
+    Ok(match config {
+        ClassifierConfig::Stub => Arc::new(StubClassifier),
+        ClassifierConfig::Grok {
+            api_key,
+            model,
+            base_url,
+        } => Arc::new(GrokClassifier::new(
             api_key.clone(),
             model.clone(),
             base_url,
@@ -93,6 +136,10 @@ pub fn router(state: AppState) -> Router {
                 .patch(target_profiles::patch)
                 .delete(target_profiles::delete),
         )
+        .route("/leads", get(leads::list))
+        .route("/leads/{id}/accept", post(leads::accept))
+        .route("/leads/{id}/reject", post(leads::reject))
+        .route("/leads/{id}/snooze", post(leads::snooze))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -137,6 +184,10 @@ pub async fn health(State(state): State<AppState>) -> AppResult<Json<Health>> {
         target_profiles::get,
         target_profiles::patch,
         target_profiles::delete,
+        leads::list,
+        leads::accept,
+        leads::reject,
+        leads::snooze,
     )
 )]
 pub struct ApiDoc;

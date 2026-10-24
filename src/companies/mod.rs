@@ -266,6 +266,59 @@ pub async fn set_filter_outcome(
     Ok(())
 }
 
+/// Fill in `website`/`phone`/`category` from a places lookup, and `domain`
+/// from `website` if it normalizes. Never overwrites an existing value.
+pub async fn fill_contact_info(
+    conn: &mut SqliteConnection,
+    id: i64,
+    website: Option<&str>,
+    phone: Option<&str>,
+    category: Option<&str>,
+) -> AppResult<Company> {
+    let domain = website.and_then(normalize_domain);
+    Ok(sqlx::query_as::<_, Company>(
+        "UPDATE companies SET
+           website = COALESCE(website, ?1),
+           phone = COALESCE(phone, ?2),
+           category = COALESCE(category, ?3),
+           domain = COALESCE(domain, ?4),
+           updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?5
+         RETURNING *",
+    )
+    .bind(website)
+    .bind(phone)
+    .bind(category)
+    .bind(domain)
+    .bind(id)
+    .fetch_one(conn)
+    .await?)
+}
+
+/// Companies that passed the cheap filter and have no `company_enrichments`
+/// row of `kind` yet, oldest first.
+pub async fn list_without_enrichment(
+    conn: &mut SqliteConnection,
+    kind: &str,
+    limit: i64,
+) -> AppResult<Vec<Company>> {
+    Ok(sqlx::query_as::<_, Company>(
+        "SELECT * FROM companies
+         WHERE filter_status = 'passed'
+           AND NOT EXISTS (
+             SELECT 1 FROM company_enrichments
+             WHERE company_enrichments.company_id = companies.id
+               AND company_enrichments.kind = ?1
+           )
+         ORDER BY id
+         LIMIT ?2",
+    )
+    .bind(kind)
+    .bind(limit)
+    .fetch_all(conn)
+    .await?)
+}
+
 pub struct NewCompanySource {
     pub company_id: i64,
     pub source: String,
