@@ -77,6 +77,22 @@ pub async fn find_by_key(
     .await?)
 }
 
+/// Resolve a path segment that may be either a saved query's `id` (UUID) or
+/// its workspace-unique `key` into an id. Mirrors
+/// `crate::control::app_definitions::resolve_id`: app definitions reference
+/// saved queries by key (`QueryBinding::query`), but the query runner
+/// endpoint takes an id, so the frontend runtime hits this on every query
+/// a component binds to.
+pub async fn resolve_id(pool: &ControlPool, workspace_id: Uuid, raw: &str) -> AppResult<Uuid> {
+    if let Ok(id) = raw.parse::<Uuid>() {
+        return Ok(id);
+    }
+    find_by_key(pool, workspace_id, raw)
+        .await?
+        .map(|query| query.id)
+        .ok_or(AppError::NotFound("saved query"))
+}
+
 pub async fn create(
     pool: &ControlPool,
     workspace_id: Uuid,

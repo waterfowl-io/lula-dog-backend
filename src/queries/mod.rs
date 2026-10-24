@@ -5,7 +5,6 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::AppState;
 use crate::control::ControlPool;
@@ -23,7 +22,12 @@ pub(crate) fn control(state: &AppState) -> AppResult<&ControlPool> {
 
 #[derive(Deserialize)]
 pub struct QueryIdParam {
-    pub id: Uuid,
+    /// Either the saved query's `id` (UUID) or its workspace-unique `key`;
+    /// see `saved_queries::resolve_id`. App definitions reference saved
+    /// queries by key (`QueryBinding::query`), so the runtime running a
+    /// component's bound query hits this directly rather than listing
+    /// queries first to translate a key to an id.
+    pub id: String,
 }
 
 /// List the workspace's saved queries.
@@ -67,7 +71,10 @@ pub async fn create(
 #[utoipa::path(
     get,
     path = "/w/{workspace_id}/queries/{id}",
-    params(("workspace_id" = Uuid, Path), ("id" = Uuid, Path)),
+    params(
+        ("workspace_id" = Uuid, Path),
+        ("id" = String, Path, description = "a saved query id (UUID) or its workspace-unique key"),
+    ),
     responses(
         (status = 200, body = SavedQuery),
         (status = 404, body = crate::error::ErrorBody),
@@ -79,7 +86,7 @@ pub async fn get(
     ws: WorkspaceContext,
     Path(QueryIdParam { id }): Path<QueryIdParam>,
 ) -> AppResult<Json<SavedQuery>> {
-    Ok(Json(
-        saved_queries::fetch(control(&state)?, ws.id, id).await?,
-    ))
+    let control = control(&state)?;
+    let id = saved_queries::resolve_id(control, ws.id, &id).await?;
+    Ok(Json(saved_queries::fetch(control, ws.id, id).await?))
 }

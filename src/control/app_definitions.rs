@@ -71,6 +71,21 @@ pub async fn find_by_key(
     .await?)
 }
 
+/// Resolve a path segment that may be either an app definition's `id`
+/// (UUID) or its workspace-unique `key` into an id. Does not itself check
+/// that a UUID belongs to `workspace_id`; callers already do that (every
+/// other function here takes `workspace_id` and `id` together), so this
+/// just avoids a redundant lookup when `raw` parses as a UUID.
+pub async fn resolve_id(pool: &ControlPool, workspace_id: Uuid, raw: &str) -> AppResult<Uuid> {
+    if let Ok(id) = raw.parse::<Uuid>() {
+        return Ok(id);
+    }
+    find_by_key(pool, workspace_id, raw)
+        .await?
+        .map(|app| app.id)
+        .ok_or(AppError::NotFound("app definition"))
+}
+
 /// Create an app definition with no versions yet.
 pub async fn create(
     pool: &ControlPool,

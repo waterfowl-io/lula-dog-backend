@@ -204,6 +204,58 @@ async fn row_limit_truncates_and_reports_it() {
 }
 
 #[tokio::test]
+async fn saved_query_is_reachable_and_runnable_by_key_or_by_uuid() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let id = saved_query(&app, "by_key_or_uuid", "SELECT 1 AS a", json!([])).await;
+
+    let (status, by_key) = app.get("/queries/by_key_or_uuid").await;
+    assert_eq!(status, StatusCode::OK, "{by_key}");
+    assert_eq!(by_key["id"], id);
+
+    let (status, by_uuid) = app.get(&format!("/queries/{id}")).await;
+    assert_eq!(status, StatusCode::OK, "{by_uuid}");
+    assert_eq!(by_uuid["id"], id);
+
+    let (status, run_by_key) = app.post("/queries/by_key_or_uuid/run", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{run_by_key}");
+    assert_eq!(run_by_key["rows"][0][0], 1);
+
+    let (status, run_by_uuid) = app.post(&format!("/queries/{id}/run"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{run_by_uuid}");
+    assert_eq!(run_by_uuid["rows"][0][0], 1);
+}
+
+#[tokio::test]
+async fn unknown_saved_query_key_is_not_found() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let (status, body) = app.get("/queries/does-not-exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = app.post("/queries/does-not-exist/run", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn saved_query_key_from_another_workspace_is_not_found() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    saved_query(&app, "cross-ws", "SELECT 1", json!([])).await;
+
+    let (status, other_ws) = app
+        .post("/workspaces", json!({"name": "Other Workspace"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{other_ws}");
+    let other_ws_id = other_ws["id"].as_str().unwrap();
+
+    let (status, body) = app.get(&format!("/w/{other_ws_id}/queries/cross-ws")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
 async fn schema_introspection_reports_tables_and_a_primary_key() {
     let Some(app) = TestApp::with_control().await else {
         return;

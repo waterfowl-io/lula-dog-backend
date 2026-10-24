@@ -209,3 +209,60 @@ async fn rollback_creates_a_new_version_and_republishes() {
     assert_eq!(status, StatusCode::OK, "{detail}");
     assert_eq!(detail["version"]["version"], 3);
 }
+
+#[tokio::test]
+async fn app_is_reachable_by_key_or_by_uuid() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_a_saved_query(&app, "key_or_uuid_metric").await;
+    let (status, created) = app
+        .post("/apps", json!({"key": "sales", "name": "Sales"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let app_id = created["id"].as_str().unwrap();
+    app.post(
+        &format!("/apps/{app_id}/versions"),
+        json!({"definition": minimal_definition("key_or_uuid_metric")}),
+    )
+    .await;
+
+    let (status, by_key) = app.get("/apps/sales").await;
+    assert_eq!(status, StatusCode::OK, "{by_key}");
+    assert_eq!(by_key["app"]["id"], app_id);
+
+    let (status, by_uuid) = app.get(&format!("/apps/{app_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{by_uuid}");
+    assert_eq!(by_uuid["app"]["id"], app_id);
+
+    let (status, versions_by_key) = app.get("/apps/sales/versions").await;
+    assert_eq!(status, StatusCode::OK, "{versions_by_key}");
+    assert_eq!(versions_by_key.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unknown_app_key_is_not_found() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let (status, body) = app.get("/apps/does-not-exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn app_key_from_another_workspace_is_not_found() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    app.post("/apps", json!({"key": "cross-ws", "name": "Cross"}))
+        .await;
+
+    let (status, other_ws) = app
+        .post("/workspaces", json!({"name": "Other Workspace"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{other_ws}");
+    let other_ws_id = other_ws["id"].as_str().unwrap();
+
+    let (status, body) = app.get(&format!("/w/{other_ws_id}/apps/cross-ws")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}

@@ -98,14 +98,19 @@ pub struct AppDetail {
 
 #[derive(Deserialize)]
 pub struct AppIdParam {
-    app: Uuid,
+    /// Either the app definition's `id` (UUID) or its workspace-unique
+    /// `key`; see `app_definitions::resolve_id`.
+    app: String,
 }
 
 /// The published version, or the latest if nothing is published yet.
 #[utoipa::path(
     get,
     path = "/w/{workspace_id}/apps/{app}",
-    params(("workspace_id" = Uuid, Path), ("app" = Uuid, Path)),
+    params(
+        ("workspace_id" = Uuid, Path),
+        ("app" = String, Path, description = "an app definition id (UUID) or its workspace-unique key"),
+    ),
     responses(
         (status = 200, body = AppDetail),
         (status = 404, body = crate::error::ErrorBody),
@@ -117,8 +122,9 @@ pub async fn get(
     ws: WorkspaceContext,
     Path(AppIdParam { app }): Path<AppIdParam>,
 ) -> AppResult<Json<AppDetail>> {
-    let (app, version) =
-        app_definitions::fetch_published_or_latest(control(&state)?, ws.id, app).await?;
+    let control = control(&state)?;
+    let app = app_definitions::resolve_id(control, ws.id, &app).await?;
+    let (app, version) = app_definitions::fetch_published_or_latest(control, ws.id, app).await?;
     Ok(Json(AppDetail { app, version }))
 }
 
@@ -126,7 +132,10 @@ pub async fn get(
 #[utoipa::path(
     get,
     path = "/w/{workspace_id}/apps/{app}/versions",
-    params(("workspace_id" = Uuid, Path), ("app" = Uuid, Path)),
+    params(
+        ("workspace_id" = Uuid, Path),
+        ("app" = String, Path, description = "an app definition id (UUID) or its workspace-unique key"),
+    ),
     responses((status = 200, body = [AppDefinitionVersion])),
     tag = "apps"
 )]
@@ -136,6 +145,7 @@ pub async fn list_versions(
     Path(AppIdParam { app }): Path<AppIdParam>,
 ) -> AppResult<Json<Vec<AppDefinitionVersion>>> {
     let control = control(&state)?;
+    let app = app_definitions::resolve_id(control, ws.id, &app).await?;
     // 404 if the app itself doesn't exist in this workspace.
     app_definitions::fetch(control, ws.id, app).await?;
     Ok(Json(app_definitions::list_versions(control, app).await?))
@@ -154,7 +164,10 @@ pub struct NewVersion {
 #[utoipa::path(
     post,
     path = "/w/{workspace_id}/apps/{app}/versions",
-    params(("workspace_id" = Uuid, Path), ("app" = Uuid, Path)),
+    params(
+        ("workspace_id" = Uuid, Path),
+        ("app" = String, Path, description = "an app definition id (UUID) or its workspace-unique key"),
+    ),
     request_body = NewVersion,
     responses(
         (status = 201, body = AppDefinitionVersion),
@@ -170,6 +183,7 @@ pub async fn create_version(
     ApiJson(new): ApiJson<NewVersion>,
 ) -> AppResult<(StatusCode, Json<AppDefinitionVersion>)> {
     let control = control(&state)?;
+    let app = app_definitions::resolve_id(control, ws.id, &app).await?;
     app_definitions::fetch(control, ws.id, app).await?;
     let definition = parse_and_validate(control, ws.id, new.definition).await?;
     let version = app_definitions::create_version(control, app, definition, None).await?;
@@ -178,7 +192,9 @@ pub async fn create_version(
 
 #[derive(Deserialize)]
 pub struct PublishParam {
-    app: Uuid,
+    /// Either the app definition's `id` (UUID) or its workspace-unique
+    /// `key`; see `app_definitions::resolve_id`.
+    app: String,
     version: Uuid,
 }
 
@@ -188,7 +204,7 @@ pub struct PublishParam {
     path = "/w/{workspace_id}/apps/{app}/versions/{version}/publish",
     params(
         ("workspace_id" = Uuid, Path),
-        ("app" = Uuid, Path),
+        ("app" = String, Path, description = "an app definition id (UUID) or its workspace-unique key"),
         ("version" = Uuid, Path, description = "an app_definition_versions id"),
     ),
     responses(
@@ -203,8 +219,10 @@ pub async fn publish(
     ws: WorkspaceContext,
     Path(PublishParam { app, version }): Path<PublishParam>,
 ) -> AppResult<Json<AppDefinition>> {
+    let control = control(&state)?;
+    let app = app_definitions::resolve_id(control, ws.id, &app).await?;
     Ok(Json(
-        app_definitions::publish(control(&state)?, ws.id, app, version).await?,
+        app_definitions::publish(control, ws.id, app, version).await?,
     ))
 }
 
@@ -222,7 +240,10 @@ pub struct RollbackRequest {
 #[utoipa::path(
     post,
     path = "/w/{workspace_id}/apps/{app}/rollback",
-    params(("workspace_id" = Uuid, Path), ("app" = Uuid, Path)),
+    params(
+        ("workspace_id" = Uuid, Path),
+        ("app" = String, Path, description = "an app definition id (UUID) or its workspace-unique key"),
+    ),
     request_body = RollbackRequest,
     responses(
         (status = 200, body = AppDefinitionVersion),
@@ -237,6 +258,7 @@ pub async fn rollback(
     ApiJson(req): ApiJson<RollbackRequest>,
 ) -> AppResult<Json<AppDefinitionVersion>> {
     let control = control(&state)?;
+    let app = app_definitions::resolve_id(control, ws.id, &app).await?;
     app_definitions::fetch(control, ws.id, app).await?;
     let old = app_definitions::fetch_version(control, app, req.version).await?;
     let new_version = app_definitions::create_version(control, app, old.definition, None).await?;

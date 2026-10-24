@@ -141,7 +141,10 @@ fn rewrite_named_params(
 #[utoipa::path(
     post,
     path = "/w/{workspace_id}/queries/{id}/run",
-    params(("workspace_id" = Uuid, Path), ("id" = Uuid, Path)),
+    params(
+        ("workspace_id" = Uuid, Path),
+        ("id" = String, Path, description = "a saved query id (UUID) or its workspace-unique key"),
+    ),
     request_body = RunRequest,
     responses(
         (status = 200, body = RunResponse),
@@ -156,7 +159,9 @@ pub async fn run(
     Path(QueryIdParam { id }): Path<QueryIdParam>,
     ApiJson(req): ApiJson<RunRequest>,
 ) -> AppResult<Json<RunResponse>> {
-    let query = saved_queries::fetch(control(&state)?, ws.id, id).await?;
+    let control = control(&state)?;
+    let id = saved_queries::resolve_id(control, ws.id, &id).await?;
+    let query = saved_queries::fetch(control, ws.id, id).await?;
     ensure_single_select(&query.sql_text)?;
 
     let sqlite_path = state.workspaces.sqlite_path(ws.id);
