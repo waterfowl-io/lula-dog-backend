@@ -1,0 +1,237 @@
+{
+  "$defs": {
+    "ActionBinding": {
+      "description": "A write binding to a named action from `KNOWN_ACTIONS`.",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "Component": {
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "id": {
+          "type": "string"
+        },
+        "props": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Component-specific configuration: chart `chart_type`/`encoding`,\ntable `columns`, form `fields`, kanban `group_field`, etc. --\ndeliberately open-ended so the fixed `ComponentKind`s don't need a\nbespoke shape each; `validate` checks the few fields that matter for\nbinding safety per kind.",
+          "type": "object"
+        },
+        "query": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueryBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/ComponentKind"
+        }
+      },
+      "required": [
+        "id",
+        "type"
+      ],
+      "type": "object"
+    },
+    "ComponentKind": {
+      "description": "The fixed component library.",
+      "enum": [
+        "table",
+        "chart",
+        "metric_card",
+        "form",
+        "kanban",
+        "detail_view",
+        "list"
+      ],
+      "type": "string"
+    },
+    "LayoutNode": {
+      "description": "Layout primitives. A `component` leaf names one of `Page::components` by\nid; the component itself carries no layout information.",
+      "oneOf": [
+        {
+          "properties": {
+            "children": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/LayoutNode"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "row",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "children": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/LayoutNode"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "column",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "children": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/LayoutNode"
+              },
+              "type": "array"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "section",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "component_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "component",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "component_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Page": {
+      "properties": {
+        "components": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Component"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "layout": {
+          "$ref": "#/$defs/LayoutNode"
+        },
+        "path": {
+          "description": "E.g. `/opportunities/:opportunity_id`; segments starting with `:`\nare route params a binding can reference as `$route.<name>`.",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "path",
+        "title",
+        "layout"
+      ],
+      "type": "object"
+    },
+    "QueryBinding": {
+      "description": "A read binding to a saved query, by key, within the owning workspace.",
+      "properties": {
+        "params": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Named params passed to the query when it runs. A value of\n`\"$route.<name>\"` is substituted with the page's route param of\nthat name at request time; any other value is passed through.",
+          "type": "object"
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "pages": {
+      "items": {
+        "$ref": "#/$defs/Page"
+      },
+      "type": "array"
+    },
+    "version": {
+      "description": "The app definition schema format version (not the app's own\nversion number, which is `app_definition_versions.version`).",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "pages"
+  ],
+  "title": "AppDefinitionDoc",
+  "type": "object"
+}
