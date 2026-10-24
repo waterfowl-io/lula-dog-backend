@@ -58,6 +58,10 @@ async-trait = "0.1"
 # OpenAPI, served at /openapi.json so agents can discover the API.
 utoipa = { version = "5", features = ["axum_extras"] }
 
+# Lead-gen importers.
+csv = "1"
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

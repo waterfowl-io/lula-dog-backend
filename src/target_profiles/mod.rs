@@ -95,6 +95,16 @@ pub async fn fetch(conn: &mut SqliteConnection, id: i64) -> AppResult<TargetProf
         .ok_or(AppError::NotFound("target profile"))
 }
 
+/// The profile importers and enrichment use when none is specified: the
+/// first one created. Most deployments have exactly one.
+pub async fn first(conn: &mut SqliteConnection) -> AppResult<Option<TargetProfile>> {
+    Ok(
+        sqlx::query_as::<_, TargetProfile>("SELECT * FROM target_profiles ORDER BY id LIMIT 1")
+            .fetch_optional(conn)
+            .await?,
+    )
+}
+
 pub async fn list(conn: &mut SqliteConnection) -> AppResult<Vec<TargetProfile>> {
     Ok(
         sqlx::query_as::<_, TargetProfile>("SELECT * FROM target_profiles ORDER BY id")
