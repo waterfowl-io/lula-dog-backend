@@ -56,6 +56,7 @@ fn opp(company: &str, name: &str, email: &str, stage: Stage) -> NewOpportunity {
         stage: Some(stage),
         next_step: None,
         last_touch_at: None,
+        product: None,
     }
 }
 
@@ -106,10 +107,30 @@ pub async fn run(pool: &SqlitePool, lead_min_fit_score: i64) -> anyhow::Result<S
         seed_leads(&mut conn, profile.id).await?
     };
 
+    // M6: a database seeded before `field_changes.evidence` existed has the
+    // one example pending proposal (Summit Outdoor Gear's value bump) with
+    // no evidence quote. Backfill it by the exact (company, field,
+    // old_value, new_value) tuple that identifies it unambiguously; a no-op
+    // everywhere else, including a fresh seed, which already wrote it.
+    backfill_seed_evidence(&mut conn).await?;
+
     Ok(SeedSummary {
         opportunities,
         leads,
     })
+}
+
+async fn backfill_seed_evidence(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE field_changes SET evidence = ?1
+         WHERE evidence IS NULL AND field = 'value_cents'
+           AND old_value = '1450000' AND new_value = '1520000'
+           AND opportunity_id IN (SELECT id FROM opportunities WHERE company = 'Summit Outdoor Gear')",
+    )
+    .bind("We bumped the order to 4,000 boxes, so the total on our side is $15,200.00.")
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 #[expect(
@@ -128,6 +149,7 @@ async fn seed_opportunities(
         conn,
         NewOpportunity {
             value_cents: Some(840_000),
+            product: Some("Kraft E-flute mailers 9x6x3, 6k".to_owned()),
             ..opp(
                 "Northwind Coffee Roasters",
                 "Priya Raman",
@@ -161,6 +183,7 @@ async fn seed_opportunities(
         conn,
         NewOpportunity {
             value_cents: Some(375_000),
+            product: Some("Poly mailers 10x13, 25k/quarter".to_owned()),
             ..opp(
                 "Bluebird Apparel",
                 "Marcus Lee",
@@ -192,6 +215,7 @@ async fn seed_opportunities(
         NewOpportunity {
             last_touch_at: Some(ts(days_ago(5))),
             next_step: Some("Confirm pallet spec and monthly volume".to_owned()),
+            product: Some("GMA 48x40 heat-treated pallets".to_owned()),
             ..opp(
                 "Ridgeline Hardware Supply",
                 "Tom Becker",
@@ -218,6 +242,7 @@ async fn seed_opportunities(
             value_cents: Some(298_000),
             last_touch_at: Some(ts(days_ago(30))),
             next_step: Some("Check in on the next reorder in November".to_owned()),
+            product: Some("RSC boxes, repeat order".to_owned()),
             ..opp(
                 "Harbor Candle Co.",
                 "Elena Park",
@@ -235,6 +260,7 @@ async fn seed_opportunities(
         conn,
         NewOpportunity {
             value_cents: Some(1_450_000),
+            product: Some("Double-wall 24x18x18 boxes, 4k".to_owned()),
             ..opp(
                 "Summit Outdoor Gear",
                 "Jordan Diaz",
@@ -270,6 +296,7 @@ async fn seed_opportunities(
             value_cents: Some(190_000),
             last_touch_at: Some(ts(days_ago(8))),
             next_step: Some("Send reorder confirmation".to_owned()),
+            product: Some("Poly mailers 12x15.5, 10k".to_owned()),
             ..opp(
                 "Prairie Pet Supply",
                 "Sam Okafor",
@@ -294,6 +321,7 @@ async fn seed_opportunities(
         conn,
         NewOpportunity {
             value_cents: Some(450_000),
+            product: Some("Molded pulp inserts".to_owned()),
             ..opp(
                 "Coastal Ceramics Studio",
                 "Ava Nguyen",
@@ -323,6 +351,7 @@ async fn seed_opportunities(
         conn,
         NewOpportunity {
             next_step: Some("Intro call about 12-pack carriers and pallets".to_owned()),
+            product: Some("12-pack carriers + pallets".to_owned()),
             ..opp(
                 "Granite State Brewing",
                 "Riley Morgan",
@@ -341,20 +370,24 @@ async fn seed_opportunities(
 /// same convention as the example opportunities) queued as lead candidates
 /// so `/leads` isn't empty out of the box.
 async fn seed_leads(conn: &mut SqliteConnection, profile_id: i64) -> anyhow::Result<usize> {
-    let lead_defs: &[(&str, &str, &str, i64, &str)] = &[
+    let lead_defs: &[(&str, &str, &str, i64, &str, &str, i64)] = &[
         (
             "Bluebird Coffee Roasters",
             "bluebirdcoffee.example",
             "Food & beverage",
             86,
             "Ships physical goods, similar size to existing roaster accounts, no packaging vendor on file.",
+            "il_sos_llc",
+            2,
         ),
         (
             "Fernhill Candle Co.",
             "fernhillcandle.example",
             "Manufacturing",
             78,
-            "Growing DTC brand, currently hand-packing -- good fit for retail boxes.",
+            "Growing DTC brand, currently hand-packing — good fit for retail boxes.",
+            "il_sos_llc",
+            4,
         ),
         (
             "Northside Print Shop",
@@ -362,6 +395,8 @@ async fn seed_leads(conn: &mut SqliteConnection, profile_id: i64) -> anyhow::Res
             "Distribution",
             61,
             "Ships physical goods but low order volume so far; worth a qualifying call.",
+            "bizapedia",
+            6,
         ),
         (
             "Harbor & Oak Furniture",
@@ -369,10 +404,12 @@ async fn seed_leads(conn: &mut SqliteConnection, profile_id: i64) -> anyhow::Res
             "Manufacturing",
             54,
             "Bulk/industrial packaging, lower margin fit, but a large potential volume.",
+            "il_sos_llc",
+            9,
         ),
     ];
     let mut lead_count = 0;
-    for (name, domain, category, fit_score, fit_reason) in lead_defs {
+    for (name, domain, category, fit_score, fit_reason, source, discovered_days_ago) in lead_defs {
         let company = companies::upsert(
             conn,
             NewCompany {
@@ -383,6 +420,21 @@ async fn seed_leads(conn: &mut SqliteConnection, profile_id: i64) -> anyhow::Res
                 ..NewCompany::default()
             },
         )
+        .await?;
+        // A fixed `imported_at` (rather than `companies::record_source`'s
+        // `CURRENT_TIMESTAMP`), so the lead queue's source line reads a
+        // plausible age instead of always "just now".
+        sqlx::query(
+            "INSERT INTO company_sources
+               (company_id, source, source_record_key, raw_file_path, raw_row, imported_at)
+             VALUES (?1, ?2, ?3, 'seed', '{}', ?4)
+             ON CONFLICT (source, source_record_key) DO NOTHING",
+        )
+        .bind(company.id)
+        .bind(*source)
+        .bind(*domain)
+        .bind(ts(days_ago(*discovered_days_ago)))
+        .execute(&mut *conn)
         .await?;
         if leads::queue_candidate(conn, company.id, profile_id, *fit_score, Some(fit_reason))
             .await?
@@ -443,17 +495,37 @@ pub async fn seed_control_plane(control: &ControlPool, workspace_id: Uuid) -> an
     Ok(())
 }
 
-/// Derived-table SQL computing the same `stale` flag as
-/// `opportunities::list_views`'s `VIEW_SQL`, duplicated here (rather than
-/// shared) because it is deliberately a plain, inspectable saved query --
-/// every chart exposes its SQL via the `</>` button.
-const STALE_DEALS_INNER_SQL: &str = "\
-    SELECT o.*, \
-           (o.stage NOT IN ('won', 'lost') \
-            AND (COALESCE(o.last_touch_at, o.created_at) < datetime('now', '-14 days') \
-                 OR EXISTS (SELECT 1 FROM tasks t WHERE t.opportunity_id = o.id AND t.done = 0 \
-                            AND t.due_at IS NOT NULL AND date(t.due_at) < date('now')))) AS stale \
-    FROM opportunities o";
+/// The same `stale` flag as `opportunities::list_views`'s `VIEW_SQL`,
+/// duplicated here (rather than shared) because it is deliberately a plain,
+/// inspectable saved query -- every chart exposes its SQL via the `</>`
+/// button.
+const STALE_FLAG_SQL: &str = "\
+    (o.stage NOT IN ('won', 'lost') \
+     AND (COALESCE(o.last_touch_at, o.created_at) < datetime('now', '-14 days') \
+          OR EXISTS (SELECT 1 FROM tasks t WHERE t.opportunity_id = o.id AND t.done = 0 \
+                     AND t.due_at IS NOT NULL AND date(t.due_at) < date('now'))))";
+
+/// Why a deal is stale, for the kanban card and the alerts list (S6, S7):
+/// an overdue task wins over a plain quiet count, since it is the more
+/// actionable reason.
+const STALE_REASON_SQL: &str = "\
+    (CASE \
+       WHEN o.stage IN ('won', 'lost') THEN NULL \
+       WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.opportunity_id = o.id AND t.done = 0 \
+                    AND t.due_at IS NOT NULL AND date(t.due_at) < date('now')) \
+         THEN 'Task overdue' \
+       WHEN COALESCE(o.last_touch_at, o.created_at) < datetime('now', '-14 days') \
+         THEN CAST(CAST(julianday('now') - julianday(COALESCE(o.last_touch_at, o.created_at)) \
+                   AS INTEGER) AS TEXT) || ' days quiet' \
+       ELSE NULL \
+     END)";
+
+fn stale_deals_inner_sql() -> String {
+    format!(
+        "SELECT o.*, {STALE_FLAG_SQL} AS stale, {STALE_REASON_SQL} AS stale_reason \
+         FROM opportunities o"
+    )
+}
 
 #[expect(
     clippy::too_many_lines,
@@ -471,19 +543,17 @@ fn sales_saved_queries() -> Vec<NewSavedQuery> {
                  task count, staleness and pending-suggestion count."
                     .to_owned(),
             ),
-            sql_text: "SELECT o.id, o.company, o.stage, o.value_cents, o.next_step, \
-                       o.last_touch_at, \
-                       (SELECT COUNT(*) FROM tasks t WHERE t.opportunity_id = o.id \
-                        AND t.done = 0) AS open_task_count, \
-                       (o.stage NOT IN ('won', 'lost') \
-                        AND (COALESCE(o.last_touch_at, o.created_at) < datetime('now', '-14 days') \
-                             OR EXISTS (SELECT 1 FROM tasks t WHERE t.opportunity_id = o.id \
-                                        AND t.done = 0 AND t.due_at IS NOT NULL \
-                                        AND date(t.due_at) < date('now')))) AS stale, \
-                       (SELECT COUNT(*) FROM field_changes fc WHERE fc.opportunity_id = o.id \
-                        AND fc.status = 'proposed') AS pending_proposal_count \
-                       FROM opportunities o ORDER BY o.stage, o.updated_at DESC"
-                .to_owned(),
+            sql_text: format!(
+                "SELECT o.id, o.company, o.stage, o.value_cents, o.next_step, \
+                 o.last_touch_at, o.product, \
+                 (SELECT COUNT(*) FROM tasks t WHERE t.opportunity_id = o.id \
+                  AND t.done = 0) AS open_task_count, \
+                 {STALE_FLAG_SQL} AS stale, \
+                 {STALE_REASON_SQL} AS stale_reason, \
+                 (SELECT COUNT(*) FROM field_changes fc WHERE fc.opportunity_id = o.id \
+                  AND fc.status = 'proposed') AS pending_proposal_count \
+                 FROM opportunities o ORDER BY o.stage, o.updated_at DESC"
+            ),
             params: no_params.clone(),
         },
         NewSavedQuery {
@@ -536,8 +606,8 @@ fn sales_saved_queries() -> Vec<NewSavedQuery> {
                 "Open deals untouched in 14+ days, or with an overdue task.".to_owned(),
             ),
             sql_text: format!(
-                "SELECT * FROM ({STALE_DEALS_INNER_SQL}) WHERE stale = 1 \
-                 ORDER BY COALESCE(last_touch_at, created_at) ASC"
+                "SELECT * FROM ({}) WHERE stale = 1 ORDER BY COALESCE(last_touch_at, created_at) ASC",
+                stale_deals_inner_sql()
             ),
             params: no_params.clone(),
         },
@@ -545,7 +615,10 @@ fn sales_saved_queries() -> Vec<NewSavedQuery> {
             key: "stale_deals_count".to_owned(),
             name: "Stale deal count".to_owned(),
             description: Some("Count of stale deals, for the metric card.".to_owned()),
-            sql_text: format!("SELECT COUNT(*) AS value FROM ({STALE_DEALS_INNER_SQL}) WHERE stale = 1"),
+            sql_text: format!(
+                "SELECT COUNT(*) AS value FROM ({}) WHERE stale = 1",
+                stale_deals_inner_sql()
+            ),
             params: no_params.clone(),
         },
         NewSavedQuery {
@@ -553,7 +626,29 @@ fn sales_saved_queries() -> Vec<NewSavedQuery> {
             name: "Pipeline value by stage".to_owned(),
             description: Some("Open deal count and value, grouped by stage.".to_owned()),
             sql_text: "SELECT stage, COUNT(*) AS deal_count, COALESCE(SUM(value_cents), 0) AS total_value_cents \
-                       FROM opportunities WHERE stage NOT IN ('won', 'lost') GROUP BY stage"
+                       FROM opportunities WHERE stage NOT IN ('won', 'lost') GROUP BY stage \
+                       ORDER BY CASE stage WHEN 'lead' THEN 1 WHEN 'qualified' THEN 2 \
+                                WHEN 'proposal' THEN 3 ELSE 4 END"
+                .to_owned(),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "pipeline_summary".to_owned(),
+            name: "Pipeline summary".to_owned(),
+            description: Some("Deal and stage counts, for the page subtitle.".to_owned()),
+            sql_text: "SELECT COUNT(*) AS deal_count, COUNT(DISTINCT stage) AS stage_count \
+                       FROM opportunities"
+                .to_owned(),
+            params: no_params.clone(),
+        },
+        NewSavedQuery {
+            key: "leads_summary".to_owned(),
+            name: "Leads summary".to_owned(),
+            description: Some("Count of new (or un-snoozed) leads, for the page subtitle.".to_owned()),
+            sql_text: "SELECT COUNT(*) AS lead_count FROM lead_candidates \
+                       WHERE status = 'new' \
+                          OR (status = 'snoozed' \
+                              AND (snoozed_until IS NULL OR snoozed_until <= datetime('now')))"
                 .to_owned(),
             params: no_params.clone(),
         },
@@ -576,9 +671,18 @@ fn sales_saved_queries() -> Vec<NewSavedQuery> {
         NewSavedQuery {
             key: "deal_proposals".to_owned(),
             name: "Deal proposals".to_owned(),
-            description: Some("A deal's pending field-change proposals.".to_owned()),
-            sql_text: "SELECT * FROM field_changes WHERE opportunity_id = :opportunity_id \
-                       AND status = 'proposed' ORDER BY created_at"
+            description: Some(
+                "A deal's pending field-change proposals, with the source timeline entry \
+                 they came from."
+                    .to_owned(),
+            ),
+            sql_text: "SELECT fc.*, \
+                       COALESCE(te.summary, te.raw_text) AS source_summary, \
+                       COALESCE(te.occurred_at, te.created_at) AS source_date \
+                       FROM field_changes fc \
+                       LEFT JOIN timeline_entries te ON te.id = fc.entry_id \
+                       WHERE fc.opportunity_id = :opportunity_id AND fc.status = 'proposed' \
+                       ORDER BY fc.created_at"
                 .to_owned(),
             params: opportunity_id_param.clone(),
         },
@@ -594,9 +698,22 @@ fn sales_saved_queries() -> Vec<NewSavedQuery> {
         NewSavedQuery {
             key: "lead_queue".to_owned(),
             name: "Lead queue".to_owned(),
-            description: Some("New (or un-snoozed) leads, highest fit score first.".to_owned()),
+            description: Some(
+                "New (or un-snoozed) leads, highest fit score first, with where each was \
+                 found."
+                    .to_owned(),
+            ),
             sql_text: "SELECT lc.id, lc.fit_score, lc.fit_reason, lc.status, lc.snoozed_until, \
-                       c.name AS company_name, c.website, c.phone, c.category \
+                       c.name AS company_name, c.website, c.phone, c.category, \
+                       (SELECT CASE cs.source \
+                                 WHEN 'il_sos_llc' THEN 'Illinois SOS' \
+                                 WHEN 'bizapedia' THEN 'Bizapedia' \
+                                 ELSE cs.source END \
+                          FROM company_sources cs WHERE cs.company_id = c.id \
+                          ORDER BY cs.imported_at DESC LIMIT 1) AS source, \
+                       (SELECT cs.imported_at FROM company_sources cs \
+                          WHERE cs.company_id = c.id \
+                          ORDER BY cs.imported_at DESC LIMIT 1) AS source_date \
                        FROM lead_candidates lc JOIN companies c ON c.id = lc.company_id \
                        WHERE lc.status = 'new' \
                           OR (lc.status = 'snoozed' \
@@ -659,6 +776,29 @@ fn actions_map(
         .collect()
 }
 
+/// A plain, evenly-flexing layout column (the common case).
+fn column(children: Vec<app_definition::LayoutNode>) -> app_definition::LayoutNode {
+    app_definition::LayoutNode::Column {
+        children,
+        width: None,
+        flex: None,
+    }
+}
+
+/// A layout column with an explicit width and/or flex-grow factor (S8), for
+/// a row whose columns shouldn't split evenly.
+fn column_sized(
+    children: Vec<app_definition::LayoutNode>,
+    width: Option<&str>,
+    flex: Option<u32>,
+) -> app_definition::LayoutNode {
+    app_definition::LayoutNode::Column {
+        children,
+        width: width.map(str::to_owned),
+        flex,
+    }
+}
+
 /// The dashboard Jack gets from `cargo run -- seed`: a pipeline kanban by
 /// stage, a deals table, a stale-deals metric card and alert list, a
 /// pipeline-value chart, a deal detail page (fields, timeline, a paste
@@ -705,54 +845,43 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                 id: "pipeline".to_owned(),
                 path: "/".to_owned(),
                 title: "Pipeline".to_owned(),
-                layout: LayoutNode::Column {
-                    children: vec![
-                        LayoutNode::Row {
-                            children: vec![LayoutNode::Component {
-                                component_id: "new_deal_form".to_owned(),
-                            }],
-                        },
-                        LayoutNode::Row {
-                            children: vec![
-                                LayoutNode::Component {
-                                    component_id: "metric_open_value".to_owned(),
-                                },
-                                LayoutNode::Component {
-                                    component_id: "metric_won_this_month".to_owned(),
-                                },
-                                LayoutNode::Component {
-                                    component_id: "stale_metric".to_owned(),
-                                },
-                                LayoutNode::Component {
-                                    component_id: "metric_suggestions_waiting".to_owned(),
-                                },
-                            ],
-                        },
-                        LayoutNode::Component {
-                            component_id: "pipeline_kanban".to_owned(),
-                        },
-                        LayoutNode::Row {
-                            children: vec![
-                                LayoutNode::Column {
-                                    children: vec![LayoutNode::Component {
-                                        component_id: "deals_table".to_owned(),
-                                    }],
-                                },
-                                LayoutNode::Column {
-                                    children: vec![LayoutNode::Component {
-                                        component_id: "stale_alerts".to_owned(),
-                                    }],
-                                },
-                            ],
-                        },
-                        LayoutNode::Section {
-                            title: Some("Pipeline value by stage".to_owned()),
-                            children: vec![LayoutNode::Component {
-                                component_id: "pipeline_value_chart".to_owned(),
-                            }],
-                        },
-                    ],
-                },
+                header: Some(app_definition::PageHeader {
+                    subtitle: Some(query_binding("pipeline_summary")),
+                    subtitle_template: Some(
+                        "{deal_count} deals across {stage_count} stages".to_owned(),
+                    ),
+                    actions: vec!["new_deal_form".to_owned()],
+                }),
+                layout: column(vec![
+                    LayoutNode::Row {
+                        children: vec![
+                            LayoutNode::Component {
+                                component_id: "metric_open_value".to_owned(),
+                            },
+                            LayoutNode::Component {
+                                component_id: "metric_won_this_month".to_owned(),
+                            },
+                            LayoutNode::Component {
+                                component_id: "stale_metric".to_owned(),
+                            },
+                            LayoutNode::Component {
+                                component_id: "metric_suggestions_waiting".to_owned(),
+                            },
+                        ],
+                    },
+                    LayoutNode::Component {
+                        component_id: "pipeline_kanban".to_owned(),
+                    },
+                    LayoutNode::Component {
+                        component_id: "deals_table".to_owned(),
+                    },
+                    LayoutNode::Component {
+                        component_id: "stale_alerts".to_owned(),
+                    },
+                    LayoutNode::Component {
+                        component_id: "pipeline_value_chart".to_owned(),
+                    },
+                ]),
                 components: vec![
                     Component {
                         id: "new_deal_form".to_owned(),
@@ -842,27 +971,33 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                             ("group_field", json!("stage")),
                             ("card_title_field", json!("company")),
                             ("add_label", json!("Add deal")),
+                            // S13: the "+ Add deal" tile opens `new_deal_form`'s
+                            // sheet preset to this column's stage.
+                            ("add_form_id", json!("new_deal_form")),
                             (
                                 "columns",
                                 json!([
                                     {"key": "lead", "label": "Lead", "color": "#968D86", "addable": true},
                                     {"key": "qualified", "label": "Qualified", "color": "#3F7FD6"},
                                     {"key": "proposal", "label": "Proposal", "color": "#E5A228"},
-                                    {"key": "won", "label": "Won", "color": "#2E9E6A"},
-                                    {"key": "lost", "label": "Lost", "color": "#C2B8AE"},
+                                    {"key": "won", "label": "Won", "color": "#2E9E6A", "card_variant": "closed", "empty_label": "No deals in Won yet"},
+                                    {"key": "lost", "label": "Lost", "color": "#C2B8AE", "card_variant": "closed", "empty_label": "No deals in Lost yet"},
                                 ]),
                             ),
                             (
                                 "card",
                                 json!({
                                     "title_field": "company",
+                                    "subtitle_field": "product",
                                     "value_field": "value_cents",
                                     "value_format": "currency_cents",
                                     "next_step_field": "next_step",
                                     "age_field": "last_touch_at",
                                     "open_tasks_field": "open_task_count",
                                     "stale_field": "stale",
+                                    "stale_reason_field": "stale_reason",
                                     "suggestions_field": "pending_proposal_count",
+                                    "closed_field": "last_touch_at",
                                     "link": {"page": "deal_detail", "param": "opportunity_id", "param_field": "id"},
                                 }),
                             ),
@@ -875,7 +1010,22 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                         query: Some(query_binding("deals_table")),
                         action: None,
                         actions: actions_map(vec![]),
-                        props: serde_json::Map::new(),
+                        props: props(&[
+                            (
+                                "columns",
+                                json!([
+                                    {"key": "company", "label": "Company"},
+                                    {"key": "stage", "label": "Stage", "format": "stage_pill"},
+                                    {"key": "value_cents", "label": "Value", "format": "currency_cents"},
+                                    {"key": "next_step", "label": "Next step"},
+                                    {"key": "last_touch_at", "label": "Last touch", "format": "relative_date"},
+                                ]),
+                            ),
+                            (
+                                "row_link",
+                                json!({"page": "deal_detail", "param": "opportunity_id", "param_field": "id"}),
+                            ),
+                        ]),
                     },
                     Component {
                         id: "stale_alerts".to_owned(),
@@ -884,12 +1034,19 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                         query: Some(query_binding("stale_deals")),
                         action: None,
                         actions: actions_map(vec![]),
-                        props: props(&[("item_title_field", json!("company"))]),
+                        props: props(&[(
+                            "item",
+                            json!({
+                                "title_field": "company",
+                                "reason_field": "stale_reason",
+                                "link": {"page": "deal_detail", "param": "opportunity_id", "param_field": "id"},
+                            }),
+                        )]),
                     },
                     Component {
                         id: "pipeline_value_chart".to_owned(),
                         kind: ComponentKind::Chart,
-                        title: None,
+                        title: Some("Pipeline value by stage".to_owned()),
                         query: Some(query_binding("pipeline_value_by_stage")),
                         action: None,
                         actions: actions_map(vec![]),
@@ -904,40 +1061,45 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                 id: "deal_detail".to_owned(),
                 path: "/deals/:opportunity_id".to_owned(),
                 title: "Deal".to_owned(),
-                layout: LayoutNode::Column {
-                    children: vec![
-                        LayoutNode::Component {
-                            component_id: "deal_detail_view".to_owned(),
-                        },
-                        LayoutNode::Row {
-                            children: vec![
-                                LayoutNode::Column {
-                                    children: vec![
-                                        LayoutNode::Component {
-                                            component_id: "deal_details_panel".to_owned(),
-                                        },
-                                        LayoutNode::Component {
-                                            component_id: "deal_tasks".to_owned(),
-                                        },
-                                    ],
-                                },
-                                LayoutNode::Column {
-                                    children: vec![
-                                        LayoutNode::Component {
-                                            component_id: "paste_form".to_owned(),
-                                        },
-                                        LayoutNode::Component {
-                                            component_id: "deal_proposals".to_owned(),
-                                        },
-                                        LayoutNode::Component {
-                                            component_id: "deal_timeline".to_owned(),
-                                        },
-                                    ],
-                                },
-                            ],
-                        },
-                    ],
-                },
+                header: None,
+                layout: column(vec![
+                    LayoutNode::Component {
+                        component_id: "deal_detail_view".to_owned(),
+                    },
+                    LayoutNode::Row {
+                        children: vec![
+                            // S8: a narrow, fixed-width details rail
+                            // beside a wider activity column (~1:2).
+                            column_sized(
+                                vec![
+                                    LayoutNode::Component {
+                                        component_id: "deal_details_panel".to_owned(),
+                                    },
+                                    LayoutNode::Component {
+                                        component_id: "deal_tasks".to_owned(),
+                                    },
+                                ],
+                                Some("320px"),
+                                None,
+                            ),
+                            column_sized(
+                                vec![
+                                    LayoutNode::Component {
+                                        component_id: "paste_form".to_owned(),
+                                    },
+                                    LayoutNode::Component {
+                                        component_id: "deal_proposals".to_owned(),
+                                    },
+                                    LayoutNode::Component {
+                                        component_id: "deal_timeline".to_owned(),
+                                    },
+                                ],
+                                None,
+                                Some(2),
+                            ),
+                        ],
+                    },
+                ]),
                 components: vec![
                     Component {
                         id: "deal_detail_view".to_owned(),
@@ -1022,7 +1184,7 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                     Component {
                         id: "paste_form".to_owned(),
                         kind: ComponentKind::Form,
-                        title: Some("Paste an email or notes".to_owned()),
+                        title: Some("Paste an email thread".to_owned()),
                         query: None,
                         action: Some(action_binding_with(
                             "paste.submit",
@@ -1034,6 +1196,12 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                             (
                                 "placeholder",
                                 json!("Paste an email thread, call notes, or Slack message…"),
+                            ),
+                            (
+                                "helper",
+                                json!(
+                                    "Lula logs it and suggests updates. Nothing changes until you accept."
+                                ),
                             ),
                             ("button_label", json!("Add to deal")),
                         ]),
@@ -1050,13 +1218,22 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                         actions: actions_map(vec![
                             ("accept", action_binding("proposal.accept")),
                             ("reject", action_binding("proposal.reject")),
+                            ("unaccept", action_binding("proposal.unaccept")),
+                            ("unreject", action_binding("proposal.unreject")),
                         ]),
                         props: props(&[
                             ("variant", json!("proposals")),
                             ("hidden_when_empty", json!(true)),
                             (
                                 "item",
-                                json!({"field_field": "field", "old_field": "old_value", "new_field": "new_value"}),
+                                json!({
+                                    "field_field": "field",
+                                    "old_field": "old_value",
+                                    "new_field": "new_value",
+                                    "source_field": "source_summary",
+                                    "date_field": "source_date",
+                                    "evidence_field": "evidence",
+                                }),
                             ),
                         ]),
                     },
@@ -1099,11 +1276,14 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                 id: "lead_queue".to_owned(),
                 path: "/leads".to_owned(),
                 title: "Leads".to_owned(),
-                layout: LayoutNode::Column {
-                    children: vec![LayoutNode::Component {
-                        component_id: "lead_queue_list".to_owned(),
-                    }],
-                },
+                header: Some(app_definition::PageHeader {
+                    subtitle: Some(query_binding("leads_summary")),
+                    subtitle_template: Some("{lead_count} new leads · sorted by fit".to_owned()),
+                    actions: vec![],
+                }),
+                layout: column(vec![LayoutNode::Component {
+                    component_id: "lead_queue_list".to_owned(),
+                }]),
                 components: vec![Component {
                     id: "lead_queue_list".to_owned(),
                     kind: ComponentKind::List,
@@ -1124,6 +1304,16 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                                 "score_field": "fit_score",
                                 "reason_field": "fit_reason",
                                 "category_field": "category",
+                                "website_field": "website",
+                                "source_field": "source",
+                                "date_field": "source_date",
+                            }),
+                        ),
+                        (
+                            "empty",
+                            json!({
+                                "title": "No new leads",
+                                "body": "Lula checks Illinois filings each night.",
                             }),
                         ),
                     ]),

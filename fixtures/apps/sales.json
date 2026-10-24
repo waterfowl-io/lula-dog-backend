@@ -23,18 +23,19 @@
       "id": "pipeline",
       "path": "/",
       "title": "Pipeline",
+      "header": {
+        "subtitle": {
+          "query": "pipeline_summary",
+          "params": {}
+        },
+        "subtitle_template": "{deal_count} deals across {stage_count} stages",
+        "actions": [
+          "new_deal_form"
+        ]
+      },
       "layout": {
         "type": "column",
         "children": [
-          {
-            "type": "row",
-            "children": [
-              {
-                "type": "component",
-                "component_id": "new_deal_form"
-              }
-            ]
-          },
           {
             "type": "row",
             "children": [
@@ -61,37 +62,16 @@
             "component_id": "pipeline_kanban"
           },
           {
-            "type": "row",
-            "children": [
-              {
-                "type": "column",
-                "children": [
-                  {
-                    "type": "component",
-                    "component_id": "deals_table"
-                  }
-                ]
-              },
-              {
-                "type": "column",
-                "children": [
-                  {
-                    "type": "component",
-                    "component_id": "stale_alerts"
-                  }
-                ]
-              }
-            ]
+            "type": "component",
+            "component_id": "deals_table"
           },
           {
-            "type": "section",
-            "title": "Pipeline value by stage",
-            "children": [
-              {
-                "type": "component",
-                "component_id": "pipeline_value_chart"
-              }
-            ]
+            "type": "component",
+            "component_id": "stale_alerts"
+          },
+          {
+            "type": "component",
+            "component_id": "pipeline_value_chart"
           }
         ]
       },
@@ -214,9 +194,11 @@
             "params": {}
           },
           "props": {
+            "add_form_id": "new_deal_form",
             "add_label": "Add deal",
             "card": {
               "age_field": "last_touch_at",
+              "closed_field": "last_touch_at",
               "link": {
                 "page": "deal_detail",
                 "param": "opportunity_id",
@@ -225,6 +207,8 @@
               "next_step_field": "next_step",
               "open_tasks_field": "open_task_count",
               "stale_field": "stale",
+              "stale_reason_field": "stale_reason",
+              "subtitle_field": "product",
               "suggestions_field": "pending_proposal_count",
               "title_field": "company",
               "value_field": "value_cents",
@@ -249,12 +233,16 @@
                 "label": "Proposal"
               },
               {
+                "card_variant": "closed",
                 "color": "#2E9E6A",
+                "empty_label": "No deals in Won yet",
                 "key": "won",
                 "label": "Won"
               },
               {
+                "card_variant": "closed",
                 "color": "#C2B8AE",
+                "empty_label": "No deals in Lost yet",
                 "key": "lost",
                 "label": "Lost"
               }
@@ -271,7 +259,38 @@
             "params": {}
           },
           "action": null,
-          "props": {}
+          "props": {
+            "columns": [
+              {
+                "key": "company",
+                "label": "Company"
+              },
+              {
+                "format": "stage_pill",
+                "key": "stage",
+                "label": "Stage"
+              },
+              {
+                "format": "currency_cents",
+                "key": "value_cents",
+                "label": "Value"
+              },
+              {
+                "key": "next_step",
+                "label": "Next step"
+              },
+              {
+                "format": "relative_date",
+                "key": "last_touch_at",
+                "label": "Last touch"
+              }
+            ],
+            "row_link": {
+              "page": "deal_detail",
+              "param": "opportunity_id",
+              "param_field": "id"
+            }
+          }
         },
         {
           "id": "stale_alerts",
@@ -283,13 +302,21 @@
           },
           "action": null,
           "props": {
-            "item_title_field": "company"
+            "item": {
+              "link": {
+                "page": "deal_detail",
+                "param": "opportunity_id",
+                "param_field": "id"
+              },
+              "reason_field": "stale_reason",
+              "title_field": "company"
+            }
           }
         },
         {
           "id": "pipeline_value_chart",
           "type": "chart",
-          "title": null,
+          "title": "Pipeline value by stage",
           "query": {
             "query": "pipeline_value_by_stage",
             "params": {}
@@ -330,7 +357,8 @@
                     "type": "component",
                     "component_id": "deal_tasks"
                   }
-                ]
+                ],
+                "width": "320px"
               },
               {
                 "type": "column",
@@ -347,7 +375,8 @@
                     "type": "component",
                     "component_id": "deal_timeline"
                   }
-                ]
+                ],
+                "flex": 2
               }
             ]
           }
@@ -495,7 +524,7 @@
         {
           "id": "paste_form",
           "type": "form",
-          "title": "Paste an email or notes",
+          "title": "Paste an email thread",
           "query": null,
           "action": {
             "action": "paste.submit",
@@ -511,6 +540,7 @@
                 "type": "textarea"
               }
             ],
+            "helper": "Lula logs it and suggests updates. Nothing changes until you accept.",
             "placeholder": "Paste an email thread, call notes, or Slack message…"
           }
         },
@@ -533,14 +563,25 @@
             "reject": {
               "action": "proposal.reject",
               "params": {}
+            },
+            "unaccept": {
+              "action": "proposal.unaccept",
+              "params": {}
+            },
+            "unreject": {
+              "action": "proposal.unreject",
+              "params": {}
             }
           },
           "props": {
             "hidden_when_empty": true,
             "item": {
+              "date_field": "source_date",
+              "evidence_field": "evidence",
               "field_field": "field",
               "new_field": "new_value",
-              "old_field": "old_value"
+              "old_field": "old_value",
+              "source_field": "source_summary"
             },
             "variant": "proposals"
           }
@@ -585,6 +626,13 @@
       "id": "lead_queue",
       "path": "/leads",
       "title": "Leads",
+      "header": {
+        "subtitle": {
+          "query": "leads_summary",
+          "params": {}
+        },
+        "subtitle_template": "{lead_count} new leads · sorted by fit"
+      },
       "layout": {
         "type": "column",
         "children": [
@@ -619,11 +667,18 @@
             }
           },
           "props": {
+            "empty": {
+              "body": "Lula checks Illinois filings each night.",
+              "title": "No new leads"
+            },
             "item": {
               "category_field": "category",
+              "date_field": "source_date",
               "reason_field": "fit_reason",
               "score_field": "fit_score",
-              "title_field": "company_name"
+              "source_field": "source",
+              "title_field": "company_name",
+              "website_field": "website"
             },
             "variant": "leads"
           }
