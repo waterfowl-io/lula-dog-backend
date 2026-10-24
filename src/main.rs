@@ -1,8 +1,8 @@
-//! `lula-dog-backend [serve]`. `serve` is the default.
+//! `lula-dog-backend [serve|seed]`. `serve` is the default.
 
 use anyhow::bail;
 use lula_dog_backend::config::Config;
-use lula_dog_backend::{AppState, db, extractor_from_config, router};
+use lula_dog_backend::{AppState, db, extractor_from_config, router, seed};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -19,7 +19,17 @@ async fn main() -> anyhow::Result<()> {
     let command = std::env::args().nth(1);
     match command.as_deref() {
         None | Some("serve") => serve(config).await,
-        Some(other) => bail!("unknown command `{other}`; expected `serve`"),
+        Some("seed") => {
+            let pool = db::connect(&config.database_url).await?;
+            let summary = seed::run(&pool).await?;
+            tracing::info!(
+                opportunities = summary.opportunities,
+                database = %config.database_url,
+                "seeded"
+            );
+            Ok(())
+        }
+        Some(other) => bail!("unknown command `{other}`; expected `serve` or `seed`"),
     }
 }
 

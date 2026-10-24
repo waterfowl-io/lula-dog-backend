@@ -10,6 +10,7 @@ pub mod extractor;
 pub mod opportunities;
 pub mod paste;
 pub mod proposals;
+pub mod seed;
 pub mod tasks;
 pub mod time;
 pub mod timeline;
