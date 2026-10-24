@@ -697,8 +697,10 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                         },
                         LayoutNode::Row {
                             children: vec![
-                                LayoutNode::Component {
-                                    component_id: "deals_table".to_owned(),
+                                LayoutNode::Column {
+                                    children: vec![LayoutNode::Component {
+                                        component_id: "deals_table".to_owned(),
+                                    }],
                                 },
                                 LayoutNode::Column {
                                     children: vec![LayoutNode::Component {
@@ -749,7 +751,7 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                             ("value_field", json!("value")),
                             ("format", json!("currency_cents")),
                             ("caption_field", json!("deal_count")),
-                            ("caption_suffix", json!(" deals")),
+                            ("caption_suffix", json!(" deal")),
                         ]),
                     },
                     Component {
@@ -763,7 +765,7 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                             ("value_field", json!("value")),
                             ("format", json!("currency_cents")),
                             ("caption_field", json!("deal_count")),
-                            ("caption_suffix", json!(" deals")),
+                            ("caption_suffix", json!(" deal")),
                         ]),
                     },
                     Component {
@@ -789,7 +791,7 @@ pub fn sales_app_definition() -> AppDefinitionDoc {
                         props: props(&[
                             ("value_field", json!("value")),
                             ("caption_field", json!("deal_count")),
-                            ("caption_suffix", json!(" deal(s)")),
+                            ("caption_suffix", json!(" deal")),
                             ("accent", json!(true)),
                         ]),
                     },

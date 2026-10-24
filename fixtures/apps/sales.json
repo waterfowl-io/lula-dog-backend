@@ -64,8 +64,13 @@
             "type": "row",
             "children": [
               {
-                "type": "component",
-                "component_id": "deals_table"
+                "type": "column",
+                "children": [
+                  {
+                    "type": "component",
+                    "component_id": "deals_table"
+                  }
+                ]
               },
               {
                 "type": "column",
@@ -144,7 +149,7 @@
           "action": null,
           "props": {
             "caption_field": "deal_count",
-            "caption_suffix": " deals",
+            "caption_suffix": " deal",
             "format": "currency_cents",
             "value_field": "value"
           }
@@ -160,7 +165,7 @@
           "action": null,
           "props": {
             "caption_field": "deal_count",
-            "caption_suffix": " deals",
+            "caption_suffix": " deal",
             "format": "currency_cents",
             "value_field": "value"
           }
@@ -192,7 +197,7 @@
           "props": {
             "accent": true,
             "caption_field": "deal_count",
-            "caption_suffix": " deal(s)",
+            "caption_suffix": " deal",
             "value_field": "value"
           }
         },
