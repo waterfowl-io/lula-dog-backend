@@ -1,8 +1,8 @@
 //! Chat: data-mode read/write tool calls via the fake provider, the
-//! per-turn write cap, undo, build mode's phase-1 501, and workspace
-//! isolation. Gated on `TEST_CONTROL_DATABASE_URL`: skips with a printed
-//! note when it isn't set (chat conversations need an app, which needs
-//! the control plane).
+//! per-turn write cap, undo, build-mode drafts (never publishing, rejecting
+//! invalid definitions, role-gated), and workspace isolation. Gated on
+//! `TEST_CONTROL_DATABASE_URL`: skips with a printed note when it isn't set
+//! (chat conversations need an app, which needs the control plane).
 
 #![expect(
     clippy::unwrap_used,
@@ -22,6 +22,29 @@ use uuid::Uuid;
 async fn create_app(app: &TestApp, key: &str) {
     let (status, body) = app.post("/apps", json!({"key": key, "name": key})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Create and publish version 1 of `key` with `definition`, through the
+/// ordinary version-create/publish endpoints (so it's validated exactly
+/// like a build-mode draft would be, and `GET /apps/{key}` has something
+/// published to compare a later draft against).
+async fn seed_version(app: &TestApp, key: &str, definition: Value) -> String {
+    let (status, body) = app
+        .post(
+            &format!("/apps/{key}/versions"),
+            json!({"definition": definition}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let version_id = body["id"].as_str().unwrap().to_owned();
+    let (status, body) = app
+        .post(
+            &format!("/apps/{key}/versions/{version_id}/publish"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    version_id
 }
 
 async fn saved_query(app: &TestApp, key: &str, sql_text: &str) {
@@ -255,12 +278,277 @@ async fn viewer_role_cannot_reach_chat_at_all() {
     );
 }
 
+/// The default test workspace's dev user is its creator, hence `owner`
+/// (`control::workspaces::create`) -- build mode is open to them.
 #[tokio::test]
-async fn build_mode_is_not_implemented_in_this_phase() {
+async fn build_mode_adds_a_metric_card_as_an_unpublished_draft() {
     let Some(app) = TestApp::with_control().await else {
         return;
     };
     create_app(&app, "sales").await;
+    saved_query(&app, "deals_table", "SELECT 'Acme' AS company").await;
+    seed_version(
+        &app,
+        "sales",
+        json!({
+            "version": 1,
+            "pages": [{
+                "id": "pipeline",
+                "path": "/",
+                "title": "Pipeline",
+                "layout": {"type": "component", "component_id": "deals"},
+                "components": [{
+                    "id": "deals",
+                    "type": "table",
+                    "query": {"query": "deals_table"},
+                }],
+            }],
+        }),
+    )
+    .await;
+
+    let (status, body) = app
+        .post_sse(
+            "/apps/sales/chat",
+            json!({"mode": "build", "message": "add a metric card to the pipeline page"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = parse_sse(&body);
+
+    let drafts = events_named(&events, "draft_created");
+    assert_eq!(drafts.len(), 1, "{body}");
+    assert!(
+        drafts[0].data["diff_summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("added"),
+        "{body}"
+    );
+    assert_eq!(events_named(&events, "final").len(), 1, "{body}");
+    assert!(events_named(&events, "error").is_empty(), "{body}");
+
+    // The draft is a real, fetchable version, but the published app is
+    // unchanged -- build mode never publishes on its own.
+    let version_id = drafts[0].data["version_id"].as_str().unwrap();
+    let (status, version) = app.get(&format!("/apps/sales/versions/{version_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{version}");
+    assert_eq!(
+        version["definition"]["pages"][0]["components"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let (status, published) = app.get("/apps/sales").await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+    assert_eq!(
+        published["version"]["definition"]["pages"][0]["components"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "the published version must still be the original one: {published}"
+    );
+}
+
+/// An invalid edit is a tool error the model sees, never a stored draft --
+/// the fake provider can't produce one directly, so this calls
+/// `crate::chat::build`'s validation path the same way the chat tool loop
+/// does, via the public `app_definition::validate` it's built on.
+#[tokio::test]
+async fn an_invalid_draft_definition_is_never_stored() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_app(&app, "sales").await;
+    seed_version(
+        &app,
+        "sales",
+        json!({
+            "version": 1,
+            "pages": [{
+                "id": "pipeline",
+                "path": "/",
+                "title": "Pipeline",
+                "layout": {"type": "row", "children": []},
+                "components": [],
+            }],
+        }),
+    )
+    .await;
+
+    // Directly through the HTTP version-create endpoint, which runs the
+    // exact same `parse_and_validate` build mode's `propose_app_definition`
+    // tool calls -- a component referencing a saved query that doesn't
+    // exist must be rejected, not stored.
+    let (status, body) = app
+        .post(
+            "/apps/sales/versions",
+            json!({
+                "definition": {
+                    "version": 1,
+                    "pages": [{
+                        "id": "pipeline",
+                        "path": "/",
+                        "title": "Pipeline",
+                        "layout": {"type": "component", "component_id": "missing"},
+                        "components": [{
+                            "id": "missing",
+                            "type": "table",
+                            "query": {"query": "does_not_exist"},
+                        }],
+                    }],
+                },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, versions) = app.get("/apps/sales/versions").await;
+    assert_eq!(status, StatusCode::OK, "{versions}");
+    assert_eq!(
+        versions.as_array().unwrap().len(),
+        1,
+        "the invalid definition must not have been stored as a version: {versions:?}"
+    );
+}
+
+#[tokio::test]
+async fn edit_pipeline_is_a_coming_soon_stub_not_a_draft() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_app(&app, "sales").await;
+    seed_version(
+        &app,
+        "sales",
+        json!({
+            "version": 1,
+            "pages": [{
+                "id": "pipeline",
+                "path": "/",
+                "title": "Pipeline",
+                "layout": {"type": "row", "children": []},
+                "components": [],
+            }],
+        }),
+    )
+    .await;
+
+    let (status, body) = app
+        .post_sse(
+            "/apps/sales/chat",
+            json!({"mode": "build", "message": "change the ingress source to a new CSV feed"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = parse_sse(&body);
+
+    let tool_calls = events_named(&events, "tool_call");
+    assert_eq!(tool_calls.len(), 1, "{body}");
+    assert_eq!(tool_calls[0].data["name"], "edit_pipeline");
+    let tool_results = events_named(&events, "tool_result");
+    assert_eq!(tool_results[0].data["result"]["status"], "coming_soon");
+    assert!(
+        events_named(&events, "draft_created").is_empty(),
+        "the pipeline stub must not create a draft: {body}"
+    );
+
+    let (status, versions) = app.get("/apps/sales/versions").await;
+    assert_eq!(status, StatusCode::OK, "{versions}");
+    assert_eq!(versions.as_array().unwrap().len(), 1, "{versions:?}");
+}
+
+#[tokio::test]
+async fn build_mode_requires_the_admin_or_owner_role() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_app(&app, "sales").await;
+    let control = app.control.as_ref().unwrap();
+    let member = Uuid::new_v4();
+    lula_dog_backend::control::profiles::upsert_from_jwt(control, member, "member@test.example")
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'member')",
+    )
+    .bind(app.workspace_id)
+    .bind(member)
+    .execute(control)
+    .await
+    .unwrap();
+
+    let (status, body) = app
+        .post_sse_as(
+            member,
+            "/apps/sales/chat",
+            json!({"mode": "build", "message": "add a metric card"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // A viewer is refused the same way.
+    let viewer = Uuid::new_v4();
+    lula_dog_backend::control::profiles::upsert_from_jwt(control, viewer, "viewer2@test.example")
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'viewer')",
+    )
+    .bind(app.workspace_id)
+    .bind(viewer)
+    .execute(control)
+    .await
+    .unwrap();
+    let (status, body) = app
+        .post_sse_as(
+            viewer,
+            "/apps/sales/chat",
+            json!({"mode": "build", "message": "add a metric card"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Data mode is unaffected by the same role.
+    let (status, body) = app
+        .post_sse_as(
+            member,
+            "/apps/sales/chat",
+            json!({"mode": "data", "message": "hello"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn build_mode_conversations_and_versions_are_isolated_to_their_own_workspace() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_app(&app, "sales").await;
+    saved_query(&app, "deals_table", "SELECT 'Acme' AS company").await;
+    seed_version(
+        &app,
+        "sales",
+        json!({
+            "version": 1,
+            "pages": [{
+                "id": "pipeline",
+                "path": "/",
+                "title": "Pipeline",
+                "layout": {"type": "component", "component_id": "deals"},
+                "components": [{
+                    "id": "deals",
+                    "type": "table",
+                    "query": {"query": "deals_table"},
+                }],
+            }],
+        }),
+    )
+    .await;
 
     let (status, body) = app
         .post_sse(
@@ -268,7 +556,48 @@ async fn build_mode_is_not_implemented_in_this_phase() {
             json!({"mode": "build", "message": "add a metric card"}),
         )
         .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = parse_sse(&body);
+    let version_id = events_named(&events, "draft_created")[0].data["version_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, conversations) = app.get("/apps/sales/conversations?mode=build").await;
+    assert_eq!(status, StatusCode::OK, "{conversations}");
+    let conversation_id = conversations.as_array().unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, created) = app
+        .post("/workspaces", json!({"name": "Other workspace"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let other_workspace = created["id"].as_str().unwrap();
+    let (status, created_app) = app
+        .post(
+            &format!("/w/{other_workspace}/apps"),
+            json!({"key": "sales", "name": "sales"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created_app}");
+
+    // The foreign workspace never sees this conversation...
+    let (status, foreign) = app
+        .get(&format!(
+            "/w/{other_workspace}/apps/sales/conversations/{conversation_id}/messages"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{foreign}");
+
+    // ...nor this draft version, even though it names the same `sales` key.
+    let (status, foreign_version) = app
+        .get(&format!(
+            "/w/{other_workspace}/apps/sales/versions/{version_id}"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{foreign_version}");
 }
 
 #[tokio::test]
