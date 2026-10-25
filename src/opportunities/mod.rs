@@ -4,7 +4,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
-use sqlx::{FromRow, SqliteConnection};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::error::{AppError, AppResult};
@@ -238,6 +238,16 @@ fn norm(field: Field, value: Option<&str>) -> AppResult<Option<String>> {
     field.normalize(value).map_err(AppError::BadRequest)
 }
 
+/// `insert` plus the view fetch, from a pool rather than a borrowed
+/// connection -- the one entry point both the HTTP handler and
+/// `crate::actions::dispatch` (chat's `opportunity.create` tool) call, so
+/// the two can never validate differently.
+pub async fn create_via_pool(pool: &SqlitePool, new: NewOpportunity) -> AppResult<OpportunityView> {
+    let mut conn = pool.acquire().await?;
+    let created = insert(&mut conn, new).await?;
+    fetch_view(&mut conn, created.id).await
+}
+
 /// Create an opportunity.
 #[utoipa::path(
     post,
@@ -254,11 +264,9 @@ pub async fn create(
     ws: WorkspaceContext,
     ApiJson(new): ApiJson<NewOpportunity>,
 ) -> AppResult<(StatusCode, Json<OpportunityView>)> {
-    let mut conn = ws.pool.acquire().await?;
-    let created = insert(&mut conn, new).await?;
     Ok((
         StatusCode::CREATED,
-        Json(fetch_view(&mut conn, created.id).await?),
+        Json(create_via_pool(&ws.pool, new).await?),
     ))
 }
 
@@ -392,14 +400,33 @@ pub async fn patch(
     ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(patch): ApiJson<OpportunityPatch>,
 ) -> AppResult<Json<OpportunityView>> {
-    let mut tx = ws.pool.begin().await?;
+    let (view, _changes) = apply_patch_via_pool(&ws.pool, id, patch).await?;
+    Ok(Json(view))
+}
+
+/// `patch`'s logic, from a pool rather than a borrowed transaction, also
+/// returning the `FieldChange` each actually-changed field produced (each
+/// one's `old_value` is exactly what an undo needs to revert it). The one
+/// entry point both the HTTP handler and `crate::actions::dispatch` (chat's
+/// `opportunity.update`/`opportunity.update_stage` tools) call.
+pub async fn apply_patch_via_pool(
+    pool: &SqlitePool,
+    id: i64,
+    patch: OpportunityPatch,
+) -> AppResult<(OpportunityView, Vec<FieldChange>)> {
+    let mut tx = pool.begin().await?;
     let mut current = fetch(&mut tx, id).await?;
+    let mut changes = Vec::new();
     for (field, value) in patch.changes() {
         let value = norm(field, value.as_deref())?;
-        proposals::set_field(&mut tx, &current, field, value.as_deref(), None, None).await?;
+        if let Some(change) =
+            proposals::set_field(&mut tx, &current, field, value.as_deref(), None, None).await?
+        {
+            changes.push(change);
+        }
         current = fetch(&mut tx, id).await?;
     }
     let view = fetch_view(&mut tx, id).await?;
     tx.commit().await?;
-    Ok(Json(view))
+    Ok((view, changes))
 }

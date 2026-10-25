@@ -3,6 +3,7 @@
 //! queries); one SQLite file per workspace is the system of record for that
 //! workspace's editable data. See `docs/architecture.md`.
 
+pub mod actions;
 pub mod alerts;
 pub mod app_definition;
 pub mod apps;
@@ -173,9 +174,14 @@ pub fn router(state: AppState) -> Router {
             "/apps/{app}/versions",
             get(apps::list_versions).post(apps::create_version),
         )
+        .route("/apps/{app}/versions/{version}", get(apps::get_version))
         .route(
             "/apps/{app}/versions/{version}/publish",
             post(apps::publish),
+        )
+        .route(
+            "/apps/{app}/versions/{version}/discard",
+            post(apps::discard),
         )
         .route("/apps/{app}/rollback", post(apps::rollback))
         .route("/queries", get(queries::list).post(queries::create))
@@ -264,7 +270,9 @@ pub async fn health(State(state): State<AppState>) -> AppResult<Json<Health>> {
         apps::get,
         apps::list_versions,
         apps::create_version,
+        apps::get_version,
         apps::publish,
+        apps::discard,
         apps::rollback,
         queries::list,
         queries::create,

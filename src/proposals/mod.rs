@@ -6,7 +6,7 @@
 
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqliteConnection};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 
 use crate::error::{AppError, AppResult};
@@ -334,14 +334,21 @@ pub async fn accept(
     ws: WorkspaceContext,
     ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<AcceptResponse>> {
-    let mut tx = ws.pool.begin().await?;
+    Ok(Json(accept_via_pool(&ws.pool, id).await?))
+}
+
+/// `accept`'s logic, from a pool rather than a borrowed transaction -- the
+/// one entry point both the HTTP handler and `crate::actions::dispatch`
+/// (chat's `proposal.accept` tool) call. Undo reuses `unaccept_via_pool`.
+pub async fn accept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<AcceptResponse> {
+    let mut tx = pool.begin().await?;
     let proposal = accept_one(&mut tx, id).await?;
     let opportunity = opportunities::fetch_view(&mut tx, proposal.opportunity_id).await?;
     tx.commit().await?;
-    Ok(Json(AcceptResponse {
+    Ok(AcceptResponse {
         proposal,
         opportunity,
-    }))
+    })
 }
 
 /// Reject a proposal. The opportunity is unchanged.
@@ -360,7 +367,14 @@ pub async fn reject(
     ws: WorkspaceContext,
     ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<FieldChange>> {
-    let mut tx = ws.pool.begin().await?;
+    Ok(Json(reject_via_pool(&ws.pool, id).await?))
+}
+
+/// `reject`'s logic, from a pool rather than a borrowed transaction -- the
+/// one entry point both the HTTP handler and `crate::actions::dispatch`
+/// (chat's `proposal.reject` tool) call. Undo reuses `unreject_via_pool`.
+pub async fn reject_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
+    let mut tx = pool.begin().await?;
     let change = resolve(&mut tx, id, ChangeStatus::Rejected).await?;
     write_dismissal_notes(
         &mut tx,
@@ -369,7 +383,7 @@ pub async fn reject(
     )
     .await?;
     tx.commit().await?;
-    Ok(Json(change))
+    Ok(change)
 }
 
 /// Undo a just-rejected proposal within the frontend's short "Undo" window,
@@ -390,7 +404,14 @@ pub async fn unreject(
     ws: WorkspaceContext,
     ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<FieldChange>> {
-    let mut conn = ws.pool.acquire().await?;
+    Ok(Json(unreject_via_pool(&ws.pool, id).await?))
+}
+
+/// `unreject`'s logic, from a pool rather than a borrowed connection -- the
+/// one entry point both the HTTP handler and chat's undo endpoint (reversing
+/// a `proposal.reject` tool call) call.
+pub async fn unreject_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
+    let mut conn = pool.acquire().await?;
     let claimed = sqlx::query_as::<_, FieldChange>(
         "UPDATE field_changes SET status = 'proposed'
          WHERE id = ?1 AND status = 'rejected'
@@ -400,7 +421,7 @@ pub async fn unreject(
     .fetch_optional(&mut *conn)
     .await?;
     if let Some(change) = claimed {
-        return Ok(Json(change));
+        return Ok(change);
     }
     let existing: Option<ChangeStatus> =
         sqlx::query_scalar("SELECT status FROM field_changes WHERE id = ?1")
@@ -435,7 +456,14 @@ pub async fn unaccept(
     ws: WorkspaceContext,
     ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<FieldChange>> {
-    let mut tx = ws.pool.begin().await?;
+    Ok(Json(unaccept_via_pool(&ws.pool, id).await?))
+}
+
+/// `unaccept`'s logic, from a pool rather than a borrowed transaction -- the
+/// one entry point both the HTTP handler and chat's undo endpoint (reversing
+/// a `proposal.accept` tool call) call.
+pub async fn unaccept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
+    let mut tx = pool.begin().await?;
     let change: FieldChange = sqlx::query_as("SELECT * FROM field_changes WHERE id = ?1")
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -465,7 +493,7 @@ pub async fn unaccept(
     .await?
     .ok_or_else(|| AppError::Conflict(format!("proposal {id} is no longer accepted")))?;
     tx.commit().await?;
-    Ok(Json(reverted))
+    Ok(reverted)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
