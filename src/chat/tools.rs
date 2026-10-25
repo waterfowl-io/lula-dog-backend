@@ -236,14 +236,15 @@ fn action_for_tool(tool_name: &str) -> Option<&'static str> {
 
 /// A tool-level ("soft") error becomes a JSON result the model sees; a
 /// database/infra error propagates as a hard failure of the whole turn.
-fn soft_error(e: AppError) -> AppResult<Value> {
+/// Shared with `crate::chat::build`'s tool loop.
+pub(super) fn soft_error(e: AppError) -> AppResult<Value> {
     match e {
         AppError::Database(_) | AppError::Internal(_) => Err(e),
         other => Ok(json!({ "error": other.to_string() })),
     }
 }
 
-fn parse_tool_args<T: DeserializeOwned>(raw: &Value) -> AppResult<T> {
+pub(super) fn parse_tool_args<T: DeserializeOwned>(raw: &Value) -> AppResult<T> {
     serde_json::from_value(raw.clone())
         .map_err(|e| AppError::BadRequest(format!("invalid tool arguments: {e}")))
 }

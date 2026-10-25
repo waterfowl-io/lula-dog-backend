@@ -47,6 +47,7 @@ use serde::Serialize;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::auth::Auth;
+use crate::chat::build::BuildAgent;
 use crate::chat::provider::ChatProvider;
 use crate::classifier::{Classifier, GrokClassifier, StubClassifier};
 use crate::config::{ChatConfig, ClassifierConfig, CrawlerConfig, ExtractorConfig, PlacesConfig};
@@ -71,6 +72,10 @@ pub struct AppState {
     pub query_timeout_ms: u64,
     pub chat: ChatConfig,
     pub chat_provider: Arc<dyn ChatProvider>,
+    /// Build-mode chat's execution seam -- see `crate::chat::build`'s module
+    /// doc comment for why a whole turn, not just the LLM call, sits behind
+    /// this trait.
+    pub build_agent: Arc<dyn BuildAgent>,
 }
 
 impl AsRef<Auth> for AppState {

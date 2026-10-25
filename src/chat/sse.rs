@@ -1,7 +1,7 @@
 //! The SSE wire format streamed back over `POST .../chat`: `text_delta`,
 //! `tool_call`, `tool_result`, `action_applied` (data mode), `draft_created`
-//! (build mode -- defined here for the wire format, not yet emitted; see
-//! `handlers::stream_chat`), a final `final` event with usage, and `error`.
+//! (build mode -- see `crate::chat::build`), a final `final` event with
+//! usage, and `error`.
 
 use axum::response::sse::Event;
 use serde::Serialize;
@@ -38,7 +38,7 @@ pub enum ChatEvent {
     ActionApplied {
         action: ChatAction,
     },
-    /// A new draft app-definition version, in build mode. Phase 3.
+    /// A new draft app-definition version, in build mode.
     DraftCreated {
         version_id: String,
         diff_summary: String,

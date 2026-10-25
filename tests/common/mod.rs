@@ -171,6 +171,8 @@ impl TestApp {
         };
         let auth = Arc::new(Auth::from_config(&auth_mode).unwrap());
         let chat_provider = provider_from_config(&chat.provider).unwrap();
+        let build_agent =
+            lula_dog_backend::chat::build::agent_from_config(chat_provider.clone(), &chat);
         let state = AppState {
             extractor,
             control: control.clone(),
@@ -180,6 +182,7 @@ impl TestApp {
             query_timeout_ms: 5000,
             chat,
             chat_provider,
+            build_agent,
         };
         let router = router(state);
         Self {
