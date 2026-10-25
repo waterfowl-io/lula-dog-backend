@@ -191,6 +191,76 @@ pub async fn create_version(
 }
 
 #[derive(Deserialize)]
+pub struct VersionParam {
+    /// Either the app definition's `id` (UUID) or its workspace-unique
+    /// `key`; see `app_definitions::resolve_id`.
+    app: String,
+    version: Uuid,
+}
+
+/// Fetch one version by id, e.g. for a build-mode draft's preview link.
+#[utoipa::path(
+    get,
+    path = "/w/{workspace_id}/apps/{app}/versions/{version}",
+    params(
+        ("workspace_id" = Uuid, Path),
+        ("app" = String, Path, description = "an app definition id (UUID) or its workspace-unique key"),
+        ("version" = Uuid, Path, description = "an app_definition_versions id"),
+    ),
+    responses(
+        (status = 200, body = AppDefinitionVersion),
+        (status = 404, body = crate::error::ErrorBody),
+    ),
+    tag = "apps"
+)]
+pub async fn get_version(
+    State(state): State<AppState>,
+    ws: WorkspaceContext,
+    Path(VersionParam { app, version }): Path<VersionParam>,
+) -> AppResult<Json<AppDefinitionVersion>> {
+    let control = control(&state)?;
+    let app_id = app_definitions::resolve_id(control, ws.id, &app).await?;
+    // 404 if the app itself doesn't exist in this workspace.
+    app_definitions::fetch(control, ws.id, app_id).await?;
+    let found = app_definitions::fetch_version_by_id(control, version).await?;
+    if found.app_definition_id != app_id {
+        return Err(AppError::NotFound("app definition version"));
+    }
+    Ok(Json(found))
+}
+
+/// Mark a draft version discarded. Refuses the currently published version;
+/// versions stay an immutable, append-only log, so this never deletes a row
+/// -- see `app_definitions::discard_version`.
+#[utoipa::path(
+    post,
+    path = "/w/{workspace_id}/apps/{app}/versions/{version}/discard",
+    params(
+        ("workspace_id" = Uuid, Path),
+        ("app" = String, Path, description = "an app definition id (UUID) or its workspace-unique key"),
+        ("version" = Uuid, Path, description = "an app_definition_versions id"),
+    ),
+    responses(
+        (status = 200, body = AppDefinitionVersion),
+        (status = 400, body = crate::error::ErrorBody),
+        (status = 404, body = crate::error::ErrorBody),
+    ),
+    tag = "apps"
+)]
+pub async fn discard(
+    State(state): State<AppState>,
+    ws: WorkspaceContext,
+    Path(VersionParam { app, version }): Path<VersionParam>,
+) -> AppResult<Json<AppDefinitionVersion>> {
+    let control = control(&state)?;
+    let app_id = app_definitions::resolve_id(control, ws.id, &app).await?;
+    app_definitions::fetch(control, ws.id, app_id).await?;
+    Ok(Json(
+        app_definitions::discard_version(control, app_id, version).await?,
+    ))
+}
+
+#[derive(Deserialize)]
 pub struct PublishParam {
     /// Either the app definition's `id` (UUID) or its workspace-unique
     /// `key`; see `app_definitions::resolve_id`.

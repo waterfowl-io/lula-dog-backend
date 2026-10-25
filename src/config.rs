@@ -19,6 +19,9 @@ const DEFAULT_SUPABASE_JWT_AUD: &str = "authenticated";
 const DEFAULT_JWKS_TTL_SECS: u64 = 300;
 const DEFAULT_QUERY_MAX_ROWS: i64 = 1000;
 const DEFAULT_QUERY_TIMEOUT_MS: u64 = 5000;
+const DEFAULT_CHAT_MAX_TOOL_ROUNDS: u32 = 6;
+const DEFAULT_CHAT_MAX_TOKENS: u32 = 1024;
+const DEFAULT_CHAT_MAX_WRITES_PER_TURN: u32 = 5;
 /// Every workspace other than this one lives under
 /// `DATA_DIR/workspaces/{id}.db`; this one is `DATABASE_URL` directly, so a
 /// pre-step-3 single-tenant setup keeps reading the same file. See
@@ -54,6 +57,55 @@ pub struct Config {
     /// Hard cap on rows returned by `POST /w/{ws}/queries/{id}/run`.
     pub query_max_rows: i64,
     pub query_timeout_ms: u64,
+    pub chat: ChatConfig,
+}
+
+#[derive(Clone)]
+pub struct ChatConfig {
+    pub provider: ChatProviderConfig,
+    /// Model-call <-> tool-call round trips per turn, before the assistant
+    /// must answer with a final message.
+    pub max_tool_rounds: u32,
+    /// `max_tokens` passed to the provider on each model call.
+    pub max_tokens: u32,
+    /// Data-mode writes (action-tool calls) allowed per turn; exceeding it
+    /// is a tool error, never a silent stop -- see `crate::chat::tools`.
+    pub max_writes_per_turn: u32,
+    /// USD per 1M prompt/completion tokens, for recording `cost_usd` on
+    /// assistant messages. `None` leaves `cost_usd` null rather than
+    /// guessing a price.
+    pub price_input_per_1m_usd: Option<f64>,
+    pub price_output_per_1m_usd: Option<f64>,
+}
+
+#[derive(Clone)]
+pub enum ChatProviderConfig {
+    /// Deterministic, no network; exercises the real tool-calling loop in
+    /// both modes. The default when `XAI_API_KEY` is unset.
+    Fake,
+    /// xAI Grok via the OpenAI-compatible chat completions API, with
+    /// streaming.
+    Grok {
+        api_key: String,
+        model: String,
+        base_url: String,
+    },
+}
+
+impl fmt::Debug for ChatProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fake => f.write_str("Fake"),
+            Self::Grok {
+                model, base_url, ..
+            } => f
+                .debug_struct("Grok")
+                .field("api_key", &"<redacted>")
+                .field("model", model)
+                .field("base_url", base_url)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -205,6 +257,7 @@ impl fmt::Debug for Config {
             .field("auth", &self.auth)
             .field("query_max_rows", &self.query_max_rows)
             .field("query_timeout_ms", &self.query_timeout_ms)
+            .field("chat_provider", &self.chat.provider)
             .finish()
     }
 }
@@ -271,6 +324,7 @@ impl Config {
         };
         let query_max_rows = var_parsed("QUERY_MAX_ROWS", DEFAULT_QUERY_MAX_ROWS)?;
         let query_timeout_ms = var_parsed("QUERY_TIMEOUT_MS", DEFAULT_QUERY_TIMEOUT_MS)?;
+        let chat = chat_config()?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -286,8 +340,55 @@ impl Config {
             auth,
             query_max_rows,
             query_timeout_ms,
+            chat,
         })
     }
+}
+
+/// `CHAT_PROVIDER=grok|fake`, defaulting to `fake` unless `XAI_API_KEY` is
+/// set (in which case it defaults to `grok`) -- so a box with no xAI key
+/// never silently tries to reach the network, but a configured box doesn't
+/// need a second env var to turn chat on.
+fn chat_config() -> anyhow::Result<ChatConfig> {
+    let xai_api_key = var("XAI_API_KEY");
+    let provider = match var("CHAT_PROVIDER").as_deref() {
+        None => match xai_api_key {
+            Some(api_key) => ChatProviderConfig::Grok {
+                api_key,
+                model: var("XAI_CHAT_MODEL")
+                    .or_else(|| var("XAI_MODEL"))
+                    .context("CHAT_PROVIDER=grok requires XAI_CHAT_MODEL or XAI_MODEL")?,
+                base_url: var("XAI_BASE_URL").unwrap_or_else(|| DEFAULT_XAI_BASE_URL.to_owned()),
+            },
+            None => ChatProviderConfig::Fake,
+        },
+        Some("fake") => ChatProviderConfig::Fake,
+        Some("grok") => ChatProviderConfig::Grok {
+            api_key: xai_api_key.context("CHAT_PROVIDER=grok requires XAI_API_KEY")?,
+            model: var("XAI_CHAT_MODEL")
+                .or_else(|| var("XAI_MODEL"))
+                .context("CHAT_PROVIDER=grok requires XAI_CHAT_MODEL or XAI_MODEL")?,
+            base_url: var("XAI_BASE_URL").unwrap_or_else(|| DEFAULT_XAI_BASE_URL.to_owned()),
+        },
+        Some(other) => bail!("CHAT_PROVIDER must be `fake` or `grok`, got `{other}`"),
+    };
+    Ok(ChatConfig {
+        provider,
+        max_tool_rounds: var_parsed("CHAT_MAX_TOOL_ROUNDS", DEFAULT_CHAT_MAX_TOOL_ROUNDS)?,
+        max_tokens: var_parsed("CHAT_MAX_TOKENS", DEFAULT_CHAT_MAX_TOKENS)?,
+        max_writes_per_turn: var_parsed(
+            "CHAT_MAX_WRITES_PER_TURN",
+            DEFAULT_CHAT_MAX_WRITES_PER_TURN,
+        )?,
+        price_input_per_1m_usd: var("CHAT_PRICE_INPUT_PER_1M_USD")
+            .map(|v| v.parse())
+            .transpose()
+            .context("CHAT_PRICE_INPUT_PER_1M_USD is invalid")?,
+        price_output_per_1m_usd: var("CHAT_PRICE_OUTPUT_PER_1M_USD")
+            .map(|v| v.parse())
+            .transpose()
+            .context("CHAT_PRICE_OUTPUT_PER_1M_USD is invalid")?,
+    })
 }
 
 /// A set, non-empty environment variable.

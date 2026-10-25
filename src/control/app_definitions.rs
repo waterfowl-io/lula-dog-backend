@@ -35,6 +35,10 @@ pub struct AppDefinitionVersion {
     pub definition: Value,
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    /// Set when a user discards a build-mode draft. Versions are an
+    /// immutable, append-only log (`rollback` depends on that), so a
+    /// discarded draft is marked, not deleted; see `discard`.
+    pub discarded_at: Option<DateTime<Utc>>,
 }
 
 pub async fn list(pool: &ControlPool, workspace_id: Uuid) -> AppResult<Vec<AppDefinition>> {
@@ -204,7 +208,8 @@ pub async fn publish(
     .ok_or(AppError::NotFound("app definition"))
 }
 
-/// The published version, or the latest if nothing is published yet.
+/// The published version, or the latest non-discarded one if nothing is
+/// published yet.
 pub async fn fetch_published_or_latest(
     pool: &ControlPool,
     workspace_id: Uuid,
@@ -212,15 +217,11 @@ pub async fn fetch_published_or_latest(
 ) -> AppResult<(AppDefinition, AppDefinitionVersion)> {
     let app = fetch(pool, workspace_id, id).await?;
     let version = if let Some(version_id) = app.published_version_id {
-        sqlx::query_as::<_, AppDefinitionVersion>(
-            "SELECT * FROM app_definition_versions WHERE id = $1",
-        )
-        .bind(version_id)
-        .fetch_optional(pool)
-        .await?
+        fetch_version_by_id(pool, version_id).await.ok()
     } else {
         sqlx::query_as::<_, AppDefinitionVersion>(
-            "SELECT * FROM app_definition_versions WHERE app_definition_id = $1
+            "SELECT * FROM app_definition_versions
+             WHERE app_definition_id = $1 AND discarded_at IS NULL
              ORDER BY version DESC LIMIT 1",
         )
         .bind(id)
@@ -229,4 +230,48 @@ pub async fn fetch_published_or_latest(
     };
     let version = version.ok_or(AppError::NotFound("app definition version"))?;
     Ok((app, version))
+}
+
+/// Fetch a version by its id, for build-mode preview (`crate::chat::build`)
+/// -- unlike `fetch_version`, this doesn't take a `version` number because
+/// the preview link carries the version row's own id.
+pub async fn fetch_version_by_id(
+    pool: &ControlPool,
+    version_id: Uuid,
+) -> AppResult<AppDefinitionVersion> {
+    sqlx::query_as::<_, AppDefinitionVersion>("SELECT * FROM app_definition_versions WHERE id = $1")
+        .bind(version_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(AppError::NotFound("app definition version"))
+}
+
+/// Mark a draft version discarded; refuses a version that is currently
+/// published (publish first, then a later chat turn could still discard an
+/// *older* draft, just never the live one).
+pub async fn discard_version(
+    pool: &ControlPool,
+    app_definition_id: Uuid,
+    version_id: Uuid,
+) -> AppResult<AppDefinitionVersion> {
+    let app = sqlx::query_as::<_, AppDefinition>("SELECT * FROM app_definitions WHERE id = $1")
+        .bind(app_definition_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(AppError::NotFound("app definition"))?;
+    if app.published_version_id == Some(version_id) {
+        return Err(AppError::BadRequest(
+            "cannot discard the published version".to_owned(),
+        ));
+    }
+    sqlx::query_as::<_, AppDefinitionVersion>(
+        "UPDATE app_definition_versions SET discarded_at = now()
+         WHERE id = $1 AND app_definition_id = $2
+         RETURNING *",
+    )
+    .bind(version_id)
+    .bind(app_definition_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(AppError::NotFound("app definition version"))
 }
