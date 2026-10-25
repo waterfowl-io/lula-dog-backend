@@ -64,6 +64,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let extractor = extractor_from_config(&config.extractor)?;
     let auth = Arc::new(Auth::from_config(&config.auth)?);
     let workspaces = WorkspaceRegistry::new(config.data_dir.clone(), config.database_url.clone());
+    let chat_provider =
+        lula_dog_backend::chat::provider::provider_from_config(&config.chat.provider)?;
     let app = router(AppState {
         extractor,
         control,
@@ -71,6 +73,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         auth,
         query_max_rows: config.query_max_rows,
         query_timeout_ms: config.query_timeout_ms,
+        chat: config.chat.clone(),
+        chat_provider,
     });
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");

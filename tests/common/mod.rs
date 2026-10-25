@@ -24,7 +24,8 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use lula_dog_backend::auth::Auth;
-use lula_dog_backend::config::AuthMode;
+use lula_dog_backend::chat::provider::provider_from_config;
+use lula_dog_backend::config::{AuthMode, ChatConfig, ChatProviderConfig};
 use lula_dog_backend::control::{self, ControlPool};
 use lula_dog_backend::extractor::{Extractor, StubExtractor};
 use lula_dog_backend::workspace_db::WorkspaceRegistry;
@@ -34,6 +35,20 @@ use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+/// The deterministic `fake` provider, with the same defaults
+/// `Config::from_env` would pick with no env vars set at all -- tests tweak
+/// individual fields (e.g. `max_writes_per_turn`) off this.
+pub fn default_chat_config() -> ChatConfig {
+    ChatConfig {
+        provider: ChatProviderConfig::Fake,
+        max_tool_rounds: 6,
+        max_tokens: 1024,
+        max_writes_per_turn: 5,
+        price_input_per_1m_usd: None,
+        price_output_per_1m_usd: None,
+    }
+}
 
 /// Routes with no `/w/{workspace_id}` prefix.
 const PUBLIC_PATHS: &[&str] = &["/health", "/openapi.json", "/app-definition.schema.json"];
@@ -64,6 +79,7 @@ impl TestApp {
             AuthMode::Dev {
                 default_user_id: dev_user_id,
             },
+            default_chat_config(),
         )
         .await
     }
@@ -73,7 +89,28 @@ impl TestApp {
     /// every workspace id is accessible as `owner` regardless of who the
     /// token says the caller is.
     pub async fn with_auth_mode(auth_mode: AuthMode) -> Self {
-        Self::build(Arc::new(StubExtractor), None, auth_mode).await
+        Self::build(
+            Arc::new(StubExtractor),
+            None,
+            auth_mode,
+            default_chat_config(),
+        )
+        .await
+    }
+
+    /// Like `new`, but with a custom `ChatConfig` (e.g. a tighter
+    /// `max_writes_per_turn` to exercise the write cap).
+    pub async fn with_chat_config(chat: ChatConfig) -> Self {
+        let dev_user_id = Uuid::new_v4();
+        Self::build(
+            Arc::new(StubExtractor),
+            None,
+            AuthMode::Dev {
+                default_user_id: dev_user_id,
+            },
+            chat,
+        )
+        .await
     }
 
     /// Against a real Postgres control plane (`TEST_CONTROL_DATABASE_URL`),
@@ -81,6 +118,13 @@ impl TestApp {
     /// tests never collide) the dev user owns. `None`, with a printed
     /// note, when that env var isn't set.
     pub async fn with_control() -> Option<Self> {
+        Self::with_control_and_chat(default_chat_config()).await
+    }
+
+    /// Like `with_control`, but with a custom `ChatConfig` (e.g. a tighter
+    /// `max_writes_per_turn` to exercise the write cap against a real
+    /// control plane, which chat's `resolve_app`/`run_saved_query` need).
+    pub async fn with_control_and_chat(chat: ChatConfig) -> Option<Self> {
         let Ok(url) = std::env::var("TEST_CONTROL_DATABASE_URL") else {
             println!("TEST_CONTROL_DATABASE_URL not set; skipping a control-plane-backed test");
             return None;
@@ -102,6 +146,7 @@ impl TestApp {
             AuthMode::Dev {
                 default_user_id: dev_user_id,
             },
+            chat,
         )
         .await;
         app.workspace_id = workspace.id;
@@ -113,6 +158,7 @@ impl TestApp {
         extractor: Arc<dyn Extractor>,
         control: Option<ControlPool>,
         auth_mode: AuthMode,
+        chat: ChatConfig,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let legacy_url = format!("sqlite://{}", dir.path().join("legacy.db").display());
@@ -124,6 +170,7 @@ impl TestApp {
             AuthMode::Supabase { .. } => Uuid::nil(),
         };
         let auth = Arc::new(Auth::from_config(&auth_mode).unwrap());
+        let chat_provider = provider_from_config(&chat.provider).unwrap();
         let state = AppState {
             extractor,
             control: control.clone(),
@@ -131,6 +178,8 @@ impl TestApp {
             auth,
             query_max_rows: 1000,
             query_timeout_ms: 5000,
+            chat,
+            chat_provider,
         };
         let router = router(state);
         Self {
@@ -252,6 +301,62 @@ impl TestApp {
         assert_eq!(status, StatusCode::CREATED, "{json}");
         json["id"].as_i64().unwrap()
     }
+
+    /// POST to an SSE endpoint (chat) and collect the whole response body
+    /// as text -- `oneshot` already drives the response future, and the
+    /// fake provider never actually waits on anything, so the stream is
+    /// complete by the time this returns.
+    pub async fn post_sse(&self, path: &str, body: Value) -> (StatusCode, String) {
+        self.post_sse_as(self.dev_user_id, path, body).await
+    }
+
+    pub async fn post_sse_as(
+        &self,
+        user_id: Uuid,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(self.full_path(path))
+            .header("content-type", "application/json")
+            .header("x-dev-user", user_id.to_string())
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// One `event: <name>\ndata: <json>` block from an SSE body.
+pub struct SseEvent {
+    pub name: String,
+    pub data: Value,
+}
+
+/// Parse a full SSE response body into its events, in order.
+pub fn parse_sse(body: &str) -> Vec<SseEvent> {
+    let mut events = Vec::new();
+    for block in body.split("\n\n") {
+        let mut name = None;
+        let mut data = None;
+        for line in block.lines() {
+            if let Some(value) = line.strip_prefix("event:") {
+                name = Some(value.trim().to_owned());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data = Some(value.trim().to_owned());
+            }
+        }
+        if let (Some(name), Some(data)) = (name, data) {
+            events.push(SseEvent {
+                name,
+                data: serde_json::from_str(&data).unwrap_or(Value::Null),
+            });
+        }
+    }
+    events
 }
 
 /// `YYYY-MM-DD HH:MM:SS` UTC, `days` before now (negative for the future).

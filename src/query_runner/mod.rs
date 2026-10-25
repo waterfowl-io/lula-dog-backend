@@ -68,8 +68,11 @@ pub struct RunResponse {
 }
 
 /// `sql` must be exactly one `SELECT`/`WITH` statement: no trailing
-/// semicolon-separated statement, nothing else.
-fn ensure_single_select(sql: &str) -> AppResult<()> {
+/// semicolon-separated statement, nothing else. `pub(crate)`: also the
+/// validation chat's read-only SQL tool uses (`crate::chat::tools`) --
+/// the same rejection of multiple statements, `ATTACH`, `PRAGMA` and
+/// anything else that isn't a bare read.
+pub(crate) fn ensure_single_select(sql: &str) -> AppResult<()> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return Err(AppError::BadRequest("sql_text is empty".to_owned()));
@@ -188,13 +191,19 @@ pub async fn run(
     }))
 }
 
-struct Executed {
-    columns: Vec<ColumnInfo>,
-    rows: Vec<Vec<Value>>,
-    truncated: bool,
+pub(crate) struct Executed {
+    pub(crate) columns: Vec<ColumnInfo>,
+    pub(crate) rows: Vec<Vec<Value>>,
+    pub(crate) truncated: bool,
 }
 
-async fn execute(
+/// `pub(crate)`: also what chat's read-only SQL tool runs the model's
+/// `SELECT` through (`crate::chat::tools`), after the same
+/// `ensure_single_select` check. `read_only(true)` opens the SQLite
+/// connection itself `SQLITE_OPEN_READONLY`; `PRAGMA query_only = ON` is
+/// defense in depth on top of that, in case a future sqlx/SQLite change
+/// ever made the connection-level flag alone insufficient.
+pub(crate) async fn execute(
     sqlite_path: &FsPath,
     sql: &str,
     params: &BTreeMap<String, Value>,
@@ -212,6 +221,9 @@ async fn execute(
         .filename(sqlite_path)
         .read_only(true);
     let mut conn = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| sqlite_err(&e))?;
+    conn.execute("PRAGMA query_only = ON")
         .await
         .map_err(|e| sqlite_err(&e))?;
 
@@ -289,4 +301,68 @@ fn cell_to_json(row: &SqliteRow, i: usize) -> Value {
 /// message goes straight to the caller.
 fn sqlite_err(e: &sqlx::Error) -> AppError {
     AppError::BadRequest(format!("query failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `execute` itself (not just the `ensure_single_select` callers apply
+    /// first) refuses a write, because the connection is opened
+    /// `SQLITE_OPEN_READONLY` plus `PRAGMA query_only = ON` -- belt and
+    /// suspenders against a validator bug or a future caller that forgets
+    /// to call `ensure_single_select` at all. Chat's `read_only_sql` tool
+    /// (`crate::chat::tools`) and the saved-query runner both go through
+    /// this same function.
+    #[tokio::test]
+    async fn the_connection_itself_refuses_a_write_even_without_validation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sqlite_path = dir.path().join("workspace.db");
+        let url = format!("sqlite://{}", sqlite_path.display());
+        let pool = crate::db::connect(&url).await?;
+        sqlx::query("INSERT INTO opportunities (company) VALUES ('Acme')")
+            .execute(&pool)
+            .await?;
+        drop(pool);
+
+        // Bypasses `ensure_single_select` entirely, simulating a caller
+        // that forgot to validate first.
+        let result = execute(
+            &sqlite_path,
+            "INSERT INTO opportunities (company) VALUES ('Evil Corp')",
+            &BTreeMap::new(),
+            10,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a write through the read-only connection should fail"
+        );
+
+        // The row from before opening read-only is still the only one.
+        let pool = crate::db::connect(&url).await?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM opportunities")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_single_select_rejects_writes_pragma_attach_and_multiple_statements() {
+        for sql in [
+            "INSERT INTO opportunities (company) VALUES ('x')",
+            "UPDATE opportunities SET company = 'x'",
+            "DELETE FROM opportunities",
+            "DROP TABLE opportunities",
+            "PRAGMA query_only = OFF",
+            "ATTACH DATABASE 'other.db' AS other",
+            "SELECT 1; DROP TABLE opportunities",
+            "",
+        ] {
+            assert!(ensure_single_select(sql).is_err(), "should reject: {sql}");
+        }
+        assert!(ensure_single_select("SELECT 1").is_ok());
+        assert!(ensure_single_select("WITH t AS (SELECT 1) SELECT * FROM t").is_ok());
+    }
 }

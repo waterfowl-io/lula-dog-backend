@@ -9,6 +9,7 @@ pub mod app_definition;
 pub mod apps;
 pub mod auth;
 pub mod bucket;
+pub mod chat;
 pub mod classifier;
 pub mod companies;
 pub mod config;
@@ -46,8 +47,9 @@ use serde::Serialize;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::auth::Auth;
+use crate::chat::provider::ChatProvider;
 use crate::classifier::{Classifier, GrokClassifier, StubClassifier};
-use crate::config::{ClassifierConfig, CrawlerConfig, ExtractorConfig, PlacesConfig};
+use crate::config::{ChatConfig, ClassifierConfig, CrawlerConfig, ExtractorConfig, PlacesConfig};
 use crate::control::ControlPool;
 use crate::crawler::{Fetcher, HttpFetcher, StubFetcher};
 use crate::error::AppResult;
@@ -67,6 +69,8 @@ pub struct AppState {
     /// Hard cap on rows returned by `POST /w/{ws}/queries/{id}/run`.
     pub query_max_rows: i64,
     pub query_timeout_ms: u64,
+    pub chat: ChatConfig,
+    pub chat_provider: Arc<dyn ChatProvider>,
 }
 
 impl AsRef<Auth> for AppState {
@@ -184,6 +188,19 @@ pub fn router(state: AppState) -> Router {
             post(apps::discard),
         )
         .route("/apps/{app}/rollback", post(apps::rollback))
+        .route("/apps/{app}/chat", post(chat::handlers::stream_chat))
+        .route(
+            "/apps/{app}/conversations",
+            get(chat::handlers::list_conversations),
+        )
+        .route(
+            "/apps/{app}/conversations/{conversation_id}/messages",
+            get(chat::handlers::get_messages),
+        )
+        .route(
+            "/apps/{app}/chat/actions/{action_id}/undo",
+            post(chat::handlers::undo_action),
+        )
         .route("/queries", get(queries::list).post(queries::create))
         .route("/queries/{id}", get(queries::get))
         .route("/queries/{id}/run", post(query_runner::run))
@@ -274,6 +291,10 @@ pub async fn health(State(state): State<AppState>) -> AppResult<Json<Health>> {
         apps::publish,
         apps::discard,
         apps::rollback,
+        chat::handlers::stream_chat,
+        chat::handlers::list_conversations,
+        chat::handlers::get_messages,
+        chat::handlers::undo_action,
         queries::list,
         queries::create,
         queries::get,

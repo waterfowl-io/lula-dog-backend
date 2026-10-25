@@ -25,6 +25,11 @@ pub enum AppError {
     /// The detail is logged, never returned to the caller.
     #[error("{0}")]
     Internal(String),
+    /// A real, planned capability that isn't built yet -- e.g. build-mode
+    /// chat in phase 1 (see `crate::chat::handlers::stream_chat`). Distinct
+    /// from `Internal`: the message is safe to return to the caller.
+    #[error("{0}")]
+    NotImplemented(String),
 }
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -85,6 +90,7 @@ impl IntoResponse for AppError {
                     "internal error".to_owned(),
                 )
             }
+            Self::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, "not_implemented", m.clone()),
         };
         (
             status,

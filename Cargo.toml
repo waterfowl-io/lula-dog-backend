@@ -13,8 +13,13 @@ path = "src/main.rs"
 [dependencies]
 # Web
 axum = { version = "0.8", features = ["macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["trace"] }
+
+# Adapts a `tokio::sync::mpsc::Receiver` into a `futures_core::Stream` for
+# chat's SSE response body, and gives `StreamExt::next()` on both that and
+# the xAI streaming HTTP response (reqwest's `stream` feature below).
+tokio-stream = "0.1"
 
 # DB. sqlx's `sqlite` feature bundles SQLite, so there is no system library to
 # install. Only the runtime query API is used (no `query!` macros), so building
@@ -67,7 +72,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP client for the xAI extractor. rustls, not native-tls: no system OpenSSL.
 # reqwest's default features include native-tls, so `default-features = false`
 # is what actually removes it.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # The extractor trait is used as `Arc<dyn Extractor>`; native async fn in traits
 # is not dyn-compatible.
