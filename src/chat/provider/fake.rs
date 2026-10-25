@@ -2,11 +2,14 @@
 //! tool-calling loop. Used by default (`CHAT_PROVIDER` unset, no
 //! `XAI_API_KEY`) and by every backend chat test.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::{ChatProvider, ProviderError, ProviderMessage, ProviderToolCall, ProviderTurn};
+use crate::app_definition::{AppDefinitionDoc, Component, ComponentKind, LayoutNode, QueryBinding};
 use crate::chat::sse::ChatEvent;
 use crate::chat::tools::ToolSpec;
 
@@ -19,11 +22,20 @@ impl ChatProvider for FakeProvider {
     async fn complete(
         &self,
         messages: &[ProviderMessage],
-        _tools: &[ToolSpec],
+        tools: &[ToolSpec],
         _max_tokens: u32,
         deltas: &mpsc::Sender<ChatEvent>,
     ) -> Result<ProviderTurn, ProviderError> {
-        let turn = decide(messages);
+        // Build mode has its own, disjoint tool set (`propose_app_definition`
+        // only exists there); checking for it is how this stays deterministic
+        // without `ChatProvider::complete` needing a `Mode` parameter of its
+        // own.
+        let build_mode = tools.iter().any(|t| t.name == "propose_app_definition");
+        let turn = if build_mode {
+            decide_build(messages)
+        } else {
+            decide(messages)
+        };
         if let Some(text) = &turn.content {
             let _ignored = deltas
                 .send(ChatEvent::TextDelta { text: text.clone() })
@@ -44,8 +56,17 @@ fn turn(content: Option<&str>, tool_calls: Vec<ProviderToolCall>) -> ProviderTur
 }
 
 fn tool_call(name: &str, args: serde_json::Value) -> ProviderToolCall {
+    tool_call_with_id("fake_call_1", name, args)
+}
+
+/// Like `tool_call`, but with an explicit id. Needed in build mode: unlike
+/// every data-mode turn (at most one tool call), a build turn can make two
+/// calls in a row (`get_app_definition` then `propose_app_definition`), and
+/// the frontend keys live tool-activity rows by call id -- reusing
+/// `"fake_call_1"` for both within the same turn would collide.
+fn tool_call_with_id(id: &str, name: &str, args: serde_json::Value) -> ProviderToolCall {
     ProviderToolCall {
-        id: "fake_call_1".to_owned(),
+        id: id.to_owned(),
         name: name.to_owned(),
         args,
     }
@@ -150,6 +171,182 @@ fn parse_create_deal(text: &str, lower: &str) -> Option<String> {
         .trim_end_matches(['.', '!', '?'])
         .to_owned();
     (!company.is_empty()).then_some(company)
+}
+
+/// The most recent `User` message's text, scanning backwards -- build mode
+/// needs the original request even once a tool result is the last message.
+fn last_user_text(messages: &[ProviderMessage]) -> Option<&str> {
+    messages.iter().rev().find_map(|m| match m {
+        ProviderMessage::User(text) => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+/// Decide the next turn for build mode: fetch the definition, make one
+/// deterministic change from the original request's keywords, propose it,
+/// then summarize -- the same "tool result in -> decide what's next" shape
+/// `decide` uses for data mode, just with build's own tools.
+fn decide_build(messages: &[ProviderMessage]) -> ProviderTurn {
+    match messages.last() {
+        Some(ProviderMessage::Tool { name, content, .. }) if name == "get_app_definition" => {
+            let request = last_user_text(messages).unwrap_or_default();
+            let Some(definition) = content.get("definition") else {
+                return turn(
+                    Some("I couldn't read the app's current definition."),
+                    vec![],
+                );
+            };
+            build_definition_change(request, definition).map_or_else(
+                || {
+                    turn(
+                        Some(
+                            "I'm not sure how to make that change yet -- try asking me to add a \
+                             metric card or rename a column.",
+                        ),
+                        vec![],
+                    )
+                },
+                |new_definition| {
+                    turn(
+                        None,
+                        vec![tool_call_with_id(
+                            "fake_call_2",
+                            "propose_app_definition",
+                            json!({ "definition": new_definition }),
+                        )],
+                    )
+                },
+            )
+        }
+        Some(ProviderMessage::Tool { name, content, .. }) if name == "propose_app_definition" => {
+            if let Some(error) = content.get("error").and_then(Value::as_str) {
+                return turn(
+                    Some(&format!("I couldn't save that draft: {error}")),
+                    vec![],
+                );
+            }
+            let diff = content
+                .get("diff_summary")
+                .and_then(Value::as_str)
+                .unwrap_or("the app");
+            turn(Some(&format!("I made a draft:\n{diff}")), vec![])
+        }
+        Some(ProviderMessage::Tool { name, content, .. }) if name == "edit_pipeline" => {
+            let message = content
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Pipeline editing isn't built yet.");
+            turn(Some(message), vec![])
+        }
+        Some(ProviderMessage::Tool { .. }) => turn(Some("Done."), vec![]),
+        Some(ProviderMessage::User(text)) => {
+            let lower = text.to_lowercase();
+            // Deliberately not bare "pipeline": that's also the name of a
+            // real app page, so a request like "add a metric card to the
+            // pipeline page" must not be mistaken for an ingress/egress
+            // pipeline edit.
+            if lower.contains("ingress")
+                || lower.contains("egress")
+                || lower.contains("data pipeline")
+            {
+                return turn(
+                    None,
+                    vec![tool_call("edit_pipeline", json!({"request": text}))],
+                );
+            }
+            turn(None, vec![tool_call("get_app_definition", json!({}))])
+        }
+        _ => turn(Some("(fake provider) hello"), vec![]),
+    }
+}
+
+/// One deterministic edit to `definition`, from keywords in the original
+/// request. `None` means "I don't recognize this request" (a real model
+/// would attempt something; the fake provider only supports what the e2e
+/// brief actually exercises: adding a metric card, or renaming a column).
+fn build_definition_change(request: &str, definition: &Value) -> Option<Value> {
+    let doc: AppDefinitionDoc = serde_json::from_value(definition.clone()).ok()?;
+    let lower = request.to_lowercase();
+    let changed = if lower.contains("column") || lower.contains("rename") {
+        rename_first_column(doc)
+            .or_else(|| add_metric_card(serde_json::from_value(definition.clone()).ok()?))
+    } else {
+        add_metric_card(doc)
+    }?;
+    serde_json::to_value(changed).ok()
+}
+
+/// Reuse an existing saved-query key from anywhere in `doc`, so the new
+/// component passes `crate::app_definition::validate` without the fake
+/// provider needing to know which saved queries exist in this workspace.
+fn first_query_key(doc: &AppDefinitionDoc) -> Option<String> {
+    doc.pages.iter().find_map(|page| {
+        page.components
+            .iter()
+            .find_map(|c| c.query.as_ref().map(|q| q.query.clone()))
+    })
+}
+
+const METRIC_COMPONENT_ID: &str = "chat_build_metric";
+
+fn add_metric_card(mut doc: AppDefinitionDoc) -> Option<AppDefinitionDoc> {
+    let query = first_query_key(&doc)?;
+    let page = doc.pages.first_mut()?;
+    if page.components.iter().any(|c| c.id == METRIC_COMPONENT_ID) {
+        return None; // already added this component; nothing new to propose
+    }
+    page.components.push(Component {
+        id: METRIC_COMPONENT_ID.to_owned(),
+        kind: ComponentKind::MetricCard,
+        title: Some("New Metric".to_owned()),
+        query: Some(QueryBinding {
+            query,
+            params: BTreeMap::default(),
+        }),
+        action: None,
+        actions: BTreeMap::default(),
+        props: serde_json::Map::default(),
+    });
+    page.layout = LayoutNode::Row {
+        children: vec![
+            page.layout.clone(),
+            LayoutNode::Component {
+                component_id: METRIC_COMPONENT_ID.to_owned(),
+            },
+        ],
+    };
+    Some(doc)
+}
+
+fn rename_first_column(mut doc: AppDefinitionDoc) -> Option<AppDefinitionDoc> {
+    for page in &mut doc.pages {
+        for component in &mut page.components {
+            if component.kind != ComponentKind::Table {
+                continue;
+            }
+            let Some(columns) = component
+                .props
+                .get_mut("columns")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            let Some(label) = columns
+                .first()
+                .and_then(Value::as_object)
+                .and_then(|o| o.get("label"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let new_label = format!("{label} (renamed)");
+            if let Some(obj) = columns.first_mut().and_then(Value::as_object_mut) {
+                obj.insert("label".to_owned(), Value::String(new_label));
+                return Some(doc);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
