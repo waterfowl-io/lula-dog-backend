@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
+/// xAI's recommended chat model (https://docs.x.ai/docs/models, checked
+/// 2026-10-25) when neither `XAI_CHAT_MODEL` nor the legacy `XAI_MODEL`
+/// fallback is set. `EXTRACTOR=grok`/`CLASSIFIER=grok`'s `XAI_MODEL` stays
+/// required, not defaulted -- those are unrelated to chat.
+const DEFAULT_XAI_CHAT_MODEL: &str = "grok-4.7";
 const DEFAULT_BUCKET_DIR: &str = "data/bucket";
 const DEFAULT_LEAD_MIN_FIT_SCORE: i64 = 50;
 const DEFAULT_CRAWL_MAX_PAGES: u32 = 4;
@@ -588,26 +593,29 @@ fn resolve_bind_addr(server: &ServerConfig) -> String {
 /// `CHAT_PROVIDER=grok|fake`, defaulting to `fake` unless `XAI_API_KEY` is
 /// set (in which case it defaults to `grok`) -- so a box with no xAI key
 /// never silently tries to reach the network, but a configured box doesn't
-/// need a second env var to turn chat on.
+/// need a second env var to turn chat on. The model defaults to
+/// `DEFAULT_XAI_CHAT_MODEL` when neither `XAI_CHAT_MODEL` nor `XAI_MODEL`
+/// is set; the per-token prices stay env-only (see `ChatConfig`'s fields),
+/// never defaulted in code, so a price change never needs a redeploy.
 fn chat_config() -> anyhow::Result<ChatConfig> {
     let xai_api_key = var("XAI_API_KEY");
+    let chat_model = || {
+        var("XAI_CHAT_MODEL")
+            .or_else(|| var("XAI_MODEL"))
+            .unwrap_or_else(|| DEFAULT_XAI_CHAT_MODEL.to_owned())
+    };
     let provider = match var("CHAT_PROVIDER").as_deref() {
-        None => match xai_api_key {
-            Some(api_key) => ChatProviderConfig::Grok {
+        None => xai_api_key.map_or(ChatProviderConfig::Fake, |api_key| {
+            ChatProviderConfig::Grok {
                 api_key,
-                model: var("XAI_CHAT_MODEL")
-                    .or_else(|| var("XAI_MODEL"))
-                    .context("CHAT_PROVIDER=grok requires XAI_CHAT_MODEL or XAI_MODEL")?,
+                model: chat_model(),
                 base_url: var("XAI_BASE_URL").unwrap_or_else(|| DEFAULT_XAI_BASE_URL.to_owned()),
-            },
-            None => ChatProviderConfig::Fake,
-        },
+            }
+        }),
         Some("fake") => ChatProviderConfig::Fake,
         Some("grok") => ChatProviderConfig::Grok {
             api_key: xai_api_key.context("CHAT_PROVIDER=grok requires XAI_API_KEY")?,
-            model: var("XAI_CHAT_MODEL")
-                .or_else(|| var("XAI_MODEL"))
-                .context("CHAT_PROVIDER=grok requires XAI_CHAT_MODEL or XAI_MODEL")?,
+            model: chat_model(),
             base_url: var("XAI_BASE_URL").unwrap_or_else(|| DEFAULT_XAI_BASE_URL.to_owned()),
         },
         Some(other) => bail!("CHAT_PROVIDER must be `fake` or `grok`, got `{other}`"),

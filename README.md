@@ -120,9 +120,12 @@ Copy `.env.example` to `.env` to change anything. All variables are optional:
 | `QUERY_TIMEOUT_MS` | `5000` | Per-request query timeout |
 | `RUST_LOG` | `info` | Log filter |
 | `EXTRACTOR` | `stub` | `stub` or `grok` |
-| `XAI_API_KEY` | | Required when `EXTRACTOR=grok` or `CLASSIFIER=grok` |
-| `XAI_MODEL` | | Required when `EXTRACTOR=grok` or `CLASSIFIER=grok` |
+| `XAI_API_KEY` | | Required when `EXTRACTOR=grok`, `CLASSIFIER=grok`, or chat talks to xAI (see `CHAT_PROVIDER` below). In production this comes from AWS Secrets Manager, injected by ECS as the `XAI_API_KEY` env var -- same `lula-api` secret that carries `DATABASE_URL`; the code only ever reads the env var |
+| `XAI_MODEL` | | Required when `EXTRACTOR=grok` or `CLASSIFIER=grok` (unrelated to chat's model, below) |
 | `XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API root |
+| `CHAT_PROVIDER` | `fake` unless `XAI_API_KEY` is set (then `grok`) | `fake` or `grok`, the chat backend behind `POST /w/{ws}/apps/:app/chat` |
+| `XAI_CHAT_MODEL` | `grok-4.7` | Chat's model, when `CHAT_PROVIDER=grok`. Falls back to `XAI_MODEL` if only that's set, then to `grok-4.7` -- xAI's recommended chat model per [docs.x.ai/docs/models](https://docs.x.ai/docs/models) (checked 2026-10-25) |
+| `CHAT_PRICE_INPUT_PER_1M_USD` / `CHAT_PRICE_OUTPUT_PER_1M_USD` | unset | USD per 1M prompt/completion tokens, for the cost estimate on each chat turn. Unset means no estimate, never a guess. xAI's current published price for `grok-4.7` below 200k prompt tokens is $2.00 input / $6.00 output per 1M tokens -- set these two env vars to that (or whatever xAI publishes at deploy time; never hardcoded, since prices change) |
 | `BUCKET_DIR` | `data/bucket` | Local stand-in for the object store; raw source files and crawled pages |
 | `PLACES` | `stub` | `stub` or `google`, the website-lookup backend |
 | `GOOGLE_PLACES_API_KEY` | | Required when `PLACES=google` |
