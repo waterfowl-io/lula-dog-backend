@@ -3,17 +3,16 @@
 //! read by the cheap filter, the classifier and lead queueing.
 
 use axum::Json;
-use axum::extract::State;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json as SqlxJson;
 use sqlx::{FromRow, SqliteConnection};
 use utoipa::ToSchema;
 
-use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::extract::{ApiJson, ApiPath};
+use crate::extract::{ApiJson, ApiPath, IdPath};
 use crate::opportunities::{not_null, nullable};
+use crate::workspace_db::WorkspaceContext;
 
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct TargetProfile {
@@ -116,19 +115,21 @@ pub async fn list(conn: &mut SqliteConnection) -> AppResult<Vec<TargetProfile>> 
 /// List profiles. Created most recently use `GET /target-profiles/{id}` for one.
 #[utoipa::path(
     get,
-    path = "/target-profiles",
+    path = "/w/{workspace_id}/target-profiles",
+    params(("workspace_id" = Uuid, Path)),
     responses((status = 200, body = [TargetProfile])),
     tag = "target-profiles"
 )]
-pub async fn list_handler(State(state): State<AppState>) -> AppResult<Json<Vec<TargetProfile>>> {
-    let mut conn = state.pool.acquire().await?;
+pub async fn list_handler(ws: WorkspaceContext) -> AppResult<Json<Vec<TargetProfile>>> {
+    let mut conn = ws.pool.acquire().await?;
     Ok(Json(list(&mut conn).await?))
 }
 
 /// Create a target profile.
 #[utoipa::path(
     post,
-    path = "/target-profiles",
+    path = "/w/{workspace_id}/target-profiles",
+    params(("workspace_id" = Uuid, Path)),
     request_body = NewTargetProfile,
     responses(
         (status = 201, body = TargetProfile),
@@ -137,18 +138,18 @@ pub async fn list_handler(State(state): State<AppState>) -> AppResult<Json<Vec<T
     tag = "target-profiles"
 )]
 pub async fn create(
-    State(state): State<AppState>,
+    ws: WorkspaceContext,
     ApiJson(new): ApiJson<NewTargetProfile>,
 ) -> AppResult<(StatusCode, Json<TargetProfile>)> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     Ok((StatusCode::CREATED, Json(insert(&mut conn, new).await?)))
 }
 
 /// Fetch one target profile.
 #[utoipa::path(
     get,
-    path = "/target-profiles/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/target-profiles/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = TargetProfile),
         (status = 404, body = crate::error::ErrorBody),
@@ -156,10 +157,10 @@ pub async fn create(
     tag = "target-profiles"
 )]
 pub async fn get(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<TargetProfile>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     Ok(Json(fetch(&mut conn, id).await?))
 }
 
@@ -190,8 +191,8 @@ pub struct TargetProfilePatch {
 /// Edit a target profile.
 #[utoipa::path(
     patch,
-    path = "/target-profiles/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/target-profiles/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = TargetProfilePatch,
     responses(
         (status = 200, body = TargetProfile),
@@ -201,11 +202,11 @@ pub struct TargetProfilePatch {
     tag = "target-profiles"
 )]
 pub async fn patch(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(patch): ApiJson<TargetProfilePatch>,
 ) -> AppResult<Json<TargetProfile>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let current = fetch(&mut conn, id).await?;
     let name = match patch.name {
         Some(n) => name(&n)?,
@@ -241,8 +242,8 @@ pub async fn patch(
 /// Delete a target profile.
 #[utoipa::path(
     delete,
-    path = "/target-profiles/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/target-profiles/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 204),
         (status = 404, body = crate::error::ErrorBody),
@@ -250,10 +251,10 @@ pub async fn patch(
     tag = "target-profiles"
 )]
 pub async fn delete(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<StatusCode> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let deleted = sqlx::query("DELETE FROM target_profiles WHERE id = ?1")
         .bind(id)
         .execute(&mut *conn)

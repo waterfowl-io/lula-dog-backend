@@ -2,16 +2,15 @@
 //! a pasted thread (then `source_entry_id` points at that entry).
 
 use axum::Json;
-use axum::extract::State;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqliteConnection};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 
-use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::extract::{ApiJson, ApiPath};
+use crate::extract::{ApiJson, ApiPath, IdPath};
 use crate::opportunities::{self, not_null, nullable};
+use crate::workspace_db::WorkspaceContext;
 
 #[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
 pub struct Task {
@@ -76,7 +75,7 @@ pub async fn list_for(conn: &mut SqliteConnection, opportunity_id: i64) -> AppRe
     .await?)
 }
 
-async fn fetch(conn: &mut SqliteConnection, id: i64) -> AppResult<Task> {
+pub(crate) async fn fetch(conn: &mut SqliteConnection, id: i64) -> AppResult<Task> {
     sqlx::query_as::<_, Task>("SELECT * FROM tasks WHERE id = ?1")
         .bind(id)
         .fetch_optional(conn)
@@ -94,8 +93,8 @@ pub struct NewTask {
 /// Add a task to an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities/{id}/tasks",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}/tasks",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = NewTask,
     responses(
         (status = 201, body = Task),
@@ -105,21 +104,26 @@ pub struct NewTask {
     tag = "tasks"
 )]
 pub async fn create(
-    State(state): State<AppState>,
-    ApiPath(opportunity_id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id: opportunity_id }): ApiPath<IdPath>,
     ApiJson(new): ApiJson<NewTask>,
 ) -> AppResult<(StatusCode, Json<Task>)> {
-    let mut conn = state.pool.acquire().await?;
-    opportunities::fetch(&mut conn, opportunity_id).await?;
-    let task = insert(
-        &mut conn,
-        opportunity_id,
-        &new.title,
-        new.due_at.as_deref(),
-        None,
-    )
-    .await?;
+    let task = create_via_pool(&ws.pool, opportunity_id, &new.title, new.due_at.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(task)))
+}
+
+/// `insert` plus the opportunity-exists check, from a pool rather than a
+/// borrowed connection -- the one entry point both the HTTP handler and
+/// `crate::actions::dispatch` (chat's `task.create` tool) call.
+pub async fn create_via_pool(
+    pool: &SqlitePool,
+    opportunity_id: i64,
+    raw_title: &str,
+    raw_due_at: Option<&str>,
+) -> AppResult<Task> {
+    let mut conn = pool.acquire().await?;
+    opportunities::fetch(&mut conn, opportunity_id).await?;
+    insert(&mut conn, opportunity_id, raw_title, raw_due_at, None).await
 }
 
 /// A partial update. `"due_at": null` clears the due date.
@@ -138,8 +142,8 @@ pub struct TaskPatch {
 /// Edit a task or mark it done.
 #[utoipa::path(
     patch,
-    path = "/tasks/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/tasks/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = TaskPatch,
     responses(
         (status = 200, body = Task),
@@ -149,22 +153,40 @@ pub struct TaskPatch {
     tag = "tasks"
 )]
 pub async fn patch(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(patch): ApiJson<TaskPatch>,
 ) -> AppResult<Json<Task>> {
-    let mut conn = state.pool.acquire().await?;
+    let (_old, new) = apply_patch_via_pool(&ws.pool, id, patch).await?;
+    Ok(Json(new))
+}
+
+/// `patch`'s logic, from a pool rather than a borrowed connection, also
+/// returning the task as it stood before the patch -- what an undo (chat's
+/// `task.complete` tool) needs to revert `done`. The one entry point both
+/// the HTTP handler and `crate::actions::dispatch` call.
+pub async fn apply_patch_via_pool(
+    pool: &SqlitePool,
+    id: i64,
+    patch: TaskPatch,
+) -> AppResult<(Task, Task)> {
+    let TaskPatch {
+        title: patch_title,
+        due_at: patch_due_at,
+        done: patch_done,
+    } = patch;
+    let mut conn = pool.acquire().await?;
     let current = fetch(&mut conn, id).await?;
-    let new_title = match patch.title {
+    let new_title = match patch_title {
         Some(t) => title(&t)?,
-        None => current.title,
+        None => current.title.clone(),
     };
-    let new_due_at = match patch.due_at {
+    let new_due_at = match patch_due_at {
         Some(d) => due_at(d.as_deref())?,
-        None => current.due_at,
+        None => current.due_at.clone(),
     };
-    let new_done = patch.done.unwrap_or(current.done);
-    let task = sqlx::query_as::<_, Task>(
+    let new_done = patch_done.unwrap_or(current.done);
+    let new = sqlx::query_as::<_, Task>(
         "UPDATE tasks SET title = ?1, due_at = ?2, done = ?3 WHERE id = ?4 RETURNING *",
     )
     .bind(new_title)
@@ -173,14 +195,14 @@ pub async fn patch(
     .bind(id)
     .fetch_one(&mut *conn)
     .await?;
-    Ok(Json(task))
+    Ok((current, new))
 }
 
 /// Delete a task.
 #[utoipa::path(
     delete,
-    path = "/tasks/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/tasks/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 204),
         (status = 404, body = crate::error::ErrorBody),
@@ -188,10 +210,18 @@ pub async fn patch(
     tag = "tasks"
 )]
 pub async fn delete(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<StatusCode> {
-    let mut conn = state.pool.acquire().await?;
+    delete_via_pool(&ws.pool, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `delete`'s logic, from a pool rather than a borrowed connection -- also
+/// used to undo chat's `task.create` tool (undoing a task creation deletes
+/// it outright; there is no soft-delete state to go back to).
+pub async fn delete_via_pool(pool: &SqlitePool, id: i64) -> AppResult<()> {
+    let mut conn = pool.acquire().await?;
     let deleted = sqlx::query("DELETE FROM tasks WHERE id = ?1")
         .bind(id)
         .execute(&mut *conn)
@@ -200,5 +230,5 @@ pub async fn delete(
     if deleted == 0 {
         return Err(AppError::NotFound("task"));
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }

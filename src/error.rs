@@ -15,8 +15,45 @@ pub enum AppError {
     NotFound(&'static str),
     #[error("{0}")]
     Conflict(String),
+    /// No bearer token presented at all (no `Authorization` header). A
+    /// fixed message, not a `String`: there is no detail to carry, so
+    /// nothing to accidentally leak.
+    #[error("missing bearer token")]
+    MissingToken,
+    /// A bearer token was presented but rejected -- bad signature, wrong
+    /// issuer/audience, expired, malformed, unsupported alg, unknown `kid`,
+    /// missing `sub`/`email` claim, and so on. `m` is the precise reason,
+    /// which is an oracle for a token forger if it reaches the client: it
+    /// is logged instead (see `IntoResponse`), never returned. The client
+    /// always gets the same coarse "invalid token", ported from Desde0's
+    /// `AuthError::InvalidToken` (`/workspace/lula-auth/ref/desde0-backend/
+    /// src/auth/mod.rs`).
+    #[error("{0}")]
+    Unauthorized(String),
+    #[error("{0}")]
+    Forbidden(String),
+    /// Below `aal2` on a route that requires it (every non-public route
+    /// except `GET /me`; see `crate::auth`). A distinct code from
+    /// `Forbidden` so the frontend can route straight to the TOTP
+    /// challenge instead of showing a generic access-denied state.
+    #[error("multi-factor authentication required")]
+    MfaRequired,
+    /// The identity provider's JWKS endpoint is unreachable or erroring.
+    /// Distinct from `Unauthorized`: the token may well be valid, so a
+    /// caller should retry rather than re-authenticate.
+    #[error("{0}")]
+    ServiceUnavailable(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    /// A server-side invariant was violated (never caused by the request).
+    /// The detail is logged, never returned to the caller.
+    #[error("{0}")]
+    Internal(String),
+    /// A real, planned capability that isn't built yet -- e.g. build-mode
+    /// chat in phase 1 (see `crate::chat::handlers::stream_chat`). Distinct
+    /// from `Internal`: the message is safe to return to the caller.
+    #[error("{0}")]
+    NotImplemented(String),
 }
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -59,6 +96,29 @@ impl IntoResponse for AppError {
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m.clone()),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
             Self::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.clone()),
+            Self::MissingToken => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing token".to_owned(),
+            ),
+            Self::Unauthorized(m) => {
+                tracing::warn!(error = %m, "bearer token rejected");
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "invalid token".to_owned(),
+                )
+            }
+            Self::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m.clone()),
+            Self::MfaRequired => (StatusCode::FORBIDDEN, "mfa_required", self.to_string()),
+            Self::ServiceUnavailable(m) => {
+                tracing::warn!(error = %m, "identity provider unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "auth temporarily unavailable".to_owned(),
+                )
+            }
             Self::Database(e) => {
                 tracing::error!(error = %e, "database error");
                 (
@@ -67,6 +127,15 @@ impl IntoResponse for AppError {
                     "internal error".to_owned(),
                 )
             }
+            Self::Internal(m) => {
+                tracing::error!(error = %m, "internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "internal error".to_owned(),
+                )
+            }
+            Self::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, "not_implemented", m.clone()),
         };
         (
             status,

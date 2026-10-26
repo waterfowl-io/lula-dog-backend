@@ -3,18 +3,17 @@
 //! one into a step-1 opportunity.
 
 use axum::Json;
-use axum::extract::State;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqliteConnection};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::AppState;
 use crate::classifier::Classification;
 use crate::companies::{self, Company};
 use crate::error::{AppError, AppResult};
-use crate::extract::{ApiJson, ApiPath, ApiQuery};
+use crate::extract::{ApiJson, ApiPath, ApiQuery, IdPath};
 use crate::opportunities::{self, NewOpportunity, Stage};
 use crate::timeline;
+use crate::workspace_db::WorkspaceContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -114,8 +113,8 @@ pub struct ListQuery {
 /// List leads, highest fit score first.
 #[utoipa::path(
     get,
-    path = "/leads",
-    params(ListQuery),
+    path = "/w/{workspace_id}/leads",
+    params(("workspace_id" = Uuid, Path), ListQuery),
     responses(
         (status = 200, body = [LeadView]),
         (status = 400, body = crate::error::ErrorBody),
@@ -123,10 +122,10 @@ pub struct ListQuery {
     tag = "leads"
 )]
 pub async fn list(
-    State(state): State<AppState>,
+    ws: WorkspaceContext,
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> AppResult<Json<Vec<LeadView>>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let status = query.status.unwrap_or(LeadStatus::New);
     let sql = format!(
         "SELECT lc.*, {EFFECTIVE_STATUS_SQL} AS status,
@@ -169,6 +168,33 @@ pub async fn list(
         });
     }
     Ok(Json(out))
+}
+
+/// One lead by id, for chat's `get_lead` read tool.
+pub async fn fetch_view(pool: &SqlitePool, id: i64) -> AppResult<LeadView> {
+    let mut conn = pool.acquire().await?;
+    let row: LeadRow = sqlx::query_as(&format!(
+        "SELECT lc.*, {EFFECTIVE_STATUS_SQL} AS status,
+                (SELECT result FROM company_enrichments
+                  WHERE company_enrichments.company_id = lc.company_id
+                    AND company_enrichments.kind = 'classify'
+                  ORDER BY company_enrichments.id DESC LIMIT 1) AS classify_result
+         FROM lead_candidates lc WHERE lc.id = ?1"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(AppError::NotFound("lead"))?;
+    let company = companies::fetch(&mut conn, row.candidate.company_id).await?;
+    let classification = row
+        .classify_result
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Classification>(s).ok());
+    Ok(LeadView {
+        candidate: row.candidate,
+        company,
+        classification,
+    })
 }
 
 /// Atomically move a candidate out of its open state (`new`, or `snoozed`
@@ -220,8 +246,8 @@ pub struct AcceptResponse {
 /// why it was accepted.
 #[utoipa::path(
     post,
-    path = "/leads/{id}/accept",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/leads/{id}/accept",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = AcceptResponse),
         (status = 404, body = crate::error::ErrorBody),
@@ -230,10 +256,21 @@ pub struct AcceptResponse {
     tag = "leads"
 )]
 pub async fn accept(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<AcceptResponse>> {
-    let mut tx = state.pool.begin().await?;
+    Ok(Json(accept_via_pool(&ws.pool, id).await?))
+}
+
+/// `accept`'s logic, from a pool rather than a borrowed transaction -- the
+/// one entry point both the HTTP handler and `crate::actions::dispatch`
+/// (chat's `lead.accept` tool) call. Not undoable from chat, for the same
+/// reason the HTTP `unaccept`-style endpoint was never built for leads (see
+/// `crate::proposals`'s M7 note): `timeline_entries` is append-only and FKs
+/// are enforced, so reversing this would mean deleting the created
+/// opportunity, which isn't possible without violating that invariant.
+pub async fn accept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<AcceptResponse> {
+    let mut tx = pool.begin().await?;
     let lead = claim_or_conflict(&mut tx, id, "status = 'accepted'").await?;
     let company = companies::fetch(&mut tx, lead.company_id).await?;
 
@@ -247,6 +284,7 @@ pub async fn accept(
             stage: Some(Stage::Lead),
             next_step: None,
             last_touch_at: None,
+            product: None,
         },
     )
     .await?;
@@ -267,10 +305,10 @@ pub async fn accept(
         .await?;
     tx.commit().await?;
 
-    Ok(Json(AcceptResponse {
+    Ok(AcceptResponse {
         lead,
         opportunity_id: opportunity.id,
-    }))
+    })
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -282,8 +320,8 @@ pub struct RejectRequest {
 /// Reject a lead.
 #[utoipa::path(
     post,
-    path = "/leads/{id}/reject",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/leads/{id}/reject",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = RejectRequest,
     responses(
         (status = 200, body = LeadCandidate),
@@ -293,14 +331,24 @@ pub struct RejectRequest {
     tag = "leads"
 )]
 pub async fn reject(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(req): ApiJson<RejectRequest>,
 ) -> AppResult<Json<LeadCandidate>> {
-    if req.reason.trim().is_empty() {
+    Ok(Json(reject_via_pool(&ws.pool, id, &req.reason).await?))
+}
+
+/// `reject`'s logic, from a pool rather than a borrowed connection -- the
+/// one entry point both the HTTP handler and `crate::actions::dispatch`
+/// (chat's `lead.reject` tool) call. Not undoable from chat: unlike
+/// `snooze`, there is no existing "un-reject" endpoint for leads to reuse
+/// (proposals have one; leads never needed it before chat), and adding one
+/// is out of scope for this pass.
+pub async fn reject_via_pool(pool: &SqlitePool, id: i64, reason: &str) -> AppResult<LeadCandidate> {
+    if reason.trim().is_empty() {
         return Err(AppError::BadRequest("reason cannot be empty".to_owned()));
     }
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = pool.acquire().await?;
     let sql = format!(
         "UPDATE lead_candidates SET status = 'rejected', reject_reason = ?2, updated_at = CURRENT_TIMESTAMP
          WHERE id = ?1 AND {EFFECTIVE_STATUS_SQL} = 'new'
@@ -308,11 +356,11 @@ pub async fn reject(
     );
     let claimed: Option<LeadCandidate> = sqlx::query_as(&sql)
         .bind(id)
-        .bind(&req.reason)
+        .bind(reason)
         .fetch_optional(&mut *conn)
         .await?;
     if let Some(claimed) = claimed {
-        return Ok(Json(claimed));
+        return Ok(claimed);
     }
     let existing: Option<LeadStatus> = sqlx::query_scalar(&format!(
         "SELECT {EFFECTIVE_STATUS_SQL} FROM lead_candidates WHERE id = ?1"
@@ -336,8 +384,8 @@ pub struct SnoozeRequest {
 /// passed.
 #[utoipa::path(
     post,
-    path = "/leads/{id}/snooze",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/leads/{id}/snooze",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = SnoozeRequest,
     responses(
         (status = 200, body = LeadCandidate),
@@ -348,17 +396,37 @@ pub struct SnoozeRequest {
     tag = "leads"
 )]
 pub async fn snooze(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(req): ApiJson<SnoozeRequest>,
 ) -> AppResult<Json<LeadCandidate>> {
-    let until = crate::time::normalize(&req.until).ok_or_else(|| {
+    let (_prior, new) = snooze_via_pool(&ws.pool, id, &req.until).await?;
+    Ok(Json(new))
+}
+
+/// `snooze`'s logic, from a pool rather than a borrowed connection, also
+/// returning the row exactly as it stood before this snooze -- what an undo
+/// (chat's `lead.snooze` tool) restores. Note the "prior" state is read in
+/// the same transaction as the guarded `UPDATE`: if a concurrent accept,
+/// reject or snooze had raced it, that `UPDATE`'s `WHERE {EFFECTIVE_STATUS}
+/// = 'new'` guard fails and this returns a conflict instead of a stale
+/// prior, so the two reads can't disagree in a way that corrupts an undo.
+pub async fn snooze_via_pool(
+    pool: &SqlitePool,
+    id: i64,
+    raw_until: &str,
+) -> AppResult<(LeadCandidate, LeadCandidate)> {
+    let until = crate::time::normalize(raw_until).ok_or_else(|| {
         AppError::BadRequest(format!(
-            "until is not a recognized timestamp: {:?}",
-            req.until
+            "until is not a recognized timestamp: {raw_until:?}"
         ))
     })?;
-    let mut conn = state.pool.acquire().await?;
+    let mut tx = pool.begin().await?;
+    let prior: Option<LeadCandidate> =
+        sqlx::query_as("SELECT * FROM lead_candidates WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
     let sql = format!(
         "UPDATE lead_candidates SET status = 'snoozed', snoozed_until = ?2, updated_at = CURRENT_TIMESTAMP
          WHERE id = ?1 AND {EFFECTIVE_STATUS_SQL} = 'new'
@@ -367,18 +435,48 @@ pub async fn snooze(
     let claimed: Option<LeadCandidate> = sqlx::query_as(&sql)
         .bind(id)
         .bind(&until)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&mut *tx)
         .await?;
     if let Some(claimed) = claimed {
-        return Ok(Json(claimed));
+        let prior = prior.ok_or(AppError::NotFound("lead"))?;
+        tx.commit().await?;
+        return Ok((prior, claimed));
     }
     let existing: Option<LeadStatus> = sqlx::query_scalar(&format!(
         "SELECT {EFFECTIVE_STATUS_SQL} FROM lead_candidates WHERE id = ?1"
     ))
     .bind(id)
-    .fetch_optional(&mut *conn)
+    .fetch_optional(&mut *tx)
     .await?;
     Err(existing.map_or(AppError::NotFound("lead"), |status| {
         AppError::Conflict(format!("lead {id} is already {}", status.as_str()))
     }))
+}
+
+/// Restore a lead to exactly the state `snooze_via_pool` captured as
+/// `prior` (its id, status, `reject_reason` and `snoozed_until`), undoing a
+/// chat `lead.snooze` tool call. Refuses (409) if the lead is no longer
+/// `snoozed` -- something else resolved it since, so undoing here would
+/// clobber that instead.
+pub async fn restore_via_pool(
+    pool: &SqlitePool,
+    id: i64,
+    status: LeadStatus,
+    reject_reason: Option<&str>,
+    snoozed_until: Option<&str>,
+) -> AppResult<LeadCandidate> {
+    let restored = sqlx::query_as::<_, LeadCandidate>(
+        "UPDATE lead_candidates
+         SET status = ?2, reject_reason = ?3, snoozed_until = ?4, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1 AND status = 'snoozed'
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(reject_reason)
+    .bind(snoozed_until)
+    .fetch_optional(pool)
+    .await?;
+    restored
+        .ok_or_else(|| AppError::Conflict(format!("lead {id} is no longer snoozed; can't undo")))
 }

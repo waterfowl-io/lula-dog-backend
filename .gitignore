@@ -4,3 +4,8 @@
 *.db-shm
 *.db-wal
 /data
+
+# Local overrides for the layered [auth]/[server]/[database] config (see
+# src/config.rs); points at a real provider for local testing. Never commit
+# one -- config/dev.toml's HS256 dev secret is the checked-in default.
+/config/local.toml

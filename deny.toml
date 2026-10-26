@@ -6,7 +6,24 @@ all-features = false
 [advisories]
 # Unmaintained crates deep in the tree are reported for workspace crates only.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071 ("Marvin Attack"): a non-constant-time padding check in
+    # `rsa`'s private-key decrypt/sign path leaks timing information about the
+    # private key. Pulled in transitively by jsonwebtoken's `rust_crypto`
+    # backend (RS256 support). This backend is only ever used to *verify*
+    # Supabase-issued JWTs with the *public* key from the project's JWKS; the
+    # process holds no RSA private key and never signs or decrypts, so the
+    # vulnerable code path is unreachable here. No fix is available upstream
+    # (see the advisory).
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0387: secret-dependent timing in `crypto-bigint`'s
+    # subtraction/division/Montgomery-multiplication, pulled in transitively
+    # by jsonwebtoken's `rust_crypto` backend via `p256`/`p384` (ES256
+    # support). Same reasoning as above: only public-key signature
+    # verification happens here, never an operation on a secret scalar, so
+    # there is no secret for a timing side channel to leak.
+    "RUSTSEC-2026-0387",
+]
 
 [licenses]
 # Permissive licenses only. Add one here deliberately, never to silence a

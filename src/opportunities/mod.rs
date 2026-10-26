@@ -2,18 +2,17 @@
 //! open-task counts and the `stale` flag, and the detail view.
 
 use axum::Json;
-use axum::extract::State;
 use axum::http::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize};
-use sqlx::{FromRow, SqliteConnection};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::extract::{ApiJson, ApiPath, ApiQuery};
+use crate::extract::{ApiJson, ApiPath, ApiQuery, IdPath};
 use crate::proposals::{self, Field, FieldChange};
 use crate::tasks::{self, Task};
 use crate::timeline::{self, TimelineEntry};
+use crate::workspace_db::WorkspaceContext;
 
 /// Days without a touch after which an open deal is stale.
 pub const STALE_AFTER_DAYS: i64 = 14;
@@ -62,6 +61,9 @@ pub struct Opportunity {
     pub stage: Stage,
     pub next_step: Option<String>,
     pub last_touch_at: Option<String>,
+    /// A one-line product description for display (e.g. the kanban card
+    /// subtitle). Not part of the proposal/audit-trail system.
+    pub product: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -163,8 +165,8 @@ pub struct ListQuery {
 /// List opportunities, newest activity first.
 #[utoipa::path(
     get,
-    path = "/opportunities",
-    params(ListQuery),
+    path = "/w/{workspace_id}/opportunities",
+    params(("workspace_id" = Uuid, Path), ListQuery),
     responses(
         (status = 200, body = [OpportunityView]),
         (status = 400, body = crate::error::ErrorBody),
@@ -172,10 +174,10 @@ pub struct ListQuery {
     tag = "opportunities"
 )]
 pub async fn list(
-    State(state): State<AppState>,
+    ws: WorkspaceContext,
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> AppResult<Json<Vec<OpportunityView>>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     Ok(Json(list_views(&mut conn, query.stage, false).await?))
 }
 
@@ -191,6 +193,12 @@ pub struct NewOpportunity {
     pub next_step: Option<String>,
     /// Any timestamp `time::normalize` accepts; stored as `YYYY-MM-DD HH:MM:SS` UTC.
     pub last_touch_at: Option<String>,
+    /// A one-line product description, shown on the kanban card. Not part
+    /// of the proposal/audit-trail system, so it isn't validated like the
+    /// other fields; absent for requests (like `opportunity.create`) that
+    /// don't collect it.
+    #[serde(default)]
+    pub product: Option<String>,
 }
 
 /// Validate and insert. The one writer of new opportunity rows; the seed
@@ -210,8 +218,8 @@ pub async fn insert(conn: &mut SqliteConnection, new: NewOpportunity) -> AppResu
     let stage = new.stage.unwrap_or(Stage::Lead);
     Ok(sqlx::query_as::<_, Opportunity>(
         "INSERT INTO opportunities
-           (company, contact_name, contact_email, value_cents, stage, next_step, last_touch_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           (company, contact_name, contact_email, value_cents, stage, next_step, last_touch_at, product)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          RETURNING *",
     )
     .bind(company)
@@ -221,6 +229,7 @@ pub async fn insert(conn: &mut SqliteConnection, new: NewOpportunity) -> AppResu
     .bind(stage)
     .bind(next_step)
     .bind(last_touch_at)
+    .bind(new.product)
     .fetch_one(conn)
     .await?)
 }
@@ -229,10 +238,21 @@ fn norm(field: Field, value: Option<&str>) -> AppResult<Option<String>> {
     field.normalize(value).map_err(AppError::BadRequest)
 }
 
+/// `insert` plus the view fetch, from a pool rather than a borrowed
+/// connection -- the one entry point both the HTTP handler and
+/// `crate::actions::dispatch` (chat's `opportunity.create` tool) call, so
+/// the two can never validate differently.
+pub async fn create_via_pool(pool: &SqlitePool, new: NewOpportunity) -> AppResult<OpportunityView> {
+    let mut conn = pool.acquire().await?;
+    let created = insert(&mut conn, new).await?;
+    fetch_view(&mut conn, created.id).await
+}
+
 /// Create an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities",
+    path = "/w/{workspace_id}/opportunities",
+    params(("workspace_id" = Uuid, Path)),
     request_body = NewOpportunity,
     responses(
         (status = 201, body = OpportunityView),
@@ -241,14 +261,12 @@ fn norm(field: Field, value: Option<&str>) -> AppResult<Option<String>> {
     tag = "opportunities"
 )]
 pub async fn create(
-    State(state): State<AppState>,
+    ws: WorkspaceContext,
     ApiJson(new): ApiJson<NewOpportunity>,
 ) -> AppResult<(StatusCode, Json<OpportunityView>)> {
-    let mut conn = state.pool.acquire().await?;
-    let created = insert(&mut conn, new).await?;
     Ok((
         StatusCode::CREATED,
-        Json(fetch_view(&mut conn, created.id).await?),
+        Json(create_via_pool(&ws.pool, new).await?),
     ))
 }
 
@@ -266,8 +284,8 @@ pub struct OpportunityDetail {
 /// One opportunity with its timeline, pending proposals and tasks.
 #[utoipa::path(
     get,
-    path = "/opportunities/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = OpportunityDetail),
         (status = 404, body = crate::error::ErrorBody),
@@ -275,10 +293,10 @@ pub struct OpportunityDetail {
     tag = "opportunities"
 )]
 pub async fn get(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<OpportunityDetail>> {
-    let mut conn = state.pool.acquire().await?;
+    let mut conn = ws.pool.acquire().await?;
     let opportunity = fetch_view(&mut conn, id).await?;
     Ok(Json(OpportunityDetail {
         opportunity,
@@ -367,8 +385,8 @@ impl OpportunityPatch {
 /// as an accepted change with no source entry.
 #[utoipa::path(
     patch,
-    path = "/opportunities/{id}",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = OpportunityPatch,
     responses(
         (status = 200, body = OpportunityView),
@@ -378,18 +396,37 @@ impl OpportunityPatch {
     tag = "opportunities"
 )]
 pub async fn patch(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(patch): ApiJson<OpportunityPatch>,
 ) -> AppResult<Json<OpportunityView>> {
-    let mut tx = state.pool.begin().await?;
+    let (view, _changes) = apply_patch_via_pool(&ws.pool, id, patch).await?;
+    Ok(Json(view))
+}
+
+/// `patch`'s logic, from a pool rather than a borrowed transaction, also
+/// returning the `FieldChange` each actually-changed field produced (each
+/// one's `old_value` is exactly what an undo needs to revert it). The one
+/// entry point both the HTTP handler and `crate::actions::dispatch` (chat's
+/// `opportunity.update`/`opportunity.update_stage` tools) call.
+pub async fn apply_patch_via_pool(
+    pool: &SqlitePool,
+    id: i64,
+    patch: OpportunityPatch,
+) -> AppResult<(OpportunityView, Vec<FieldChange>)> {
+    let mut tx = pool.begin().await?;
     let mut current = fetch(&mut tx, id).await?;
+    let mut changes = Vec::new();
     for (field, value) in patch.changes() {
         let value = norm(field, value.as_deref())?;
-        proposals::set_field(&mut tx, &current, field, value.as_deref(), None).await?;
+        if let Some(change) =
+            proposals::set_field(&mut tx, &current, field, value.as_deref(), None, None).await?
+        {
+            changes.push(change);
+        }
         current = fetch(&mut tx, id).await?;
     }
     let view = fetch_view(&mut tx, id).await?;
     tx.commit().await?;
-    Ok(Json(view))
+    Ok((view, changes))
 }

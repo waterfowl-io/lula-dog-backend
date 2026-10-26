@@ -23,12 +23,13 @@ use utoipa::ToSchema;
 
 use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::extract::{ApiJson, ApiPath};
+use crate::extract::{ApiJson, ApiPath, IdPath};
 use crate::extractor::{Extraction, ExtractionInput, Extractor};
 use crate::opportunities::{self, Opportunity};
 use crate::proposals::{self, Field, FieldChange};
 use crate::tasks::{self, Task};
 use crate::timeline::{self, TimelineEntry};
+use crate::workspace_db::WorkspaceContext;
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -54,8 +55,8 @@ pub struct PasteResponse {
 /// Paste an email thread or notes onto an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities/{id}/paste",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}/paste",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     request_body = PasteRequest,
     responses(
         (status = 201, body = PasteResponse),
@@ -66,13 +67,14 @@ pub struct PasteResponse {
 )]
 pub async fn paste(
     State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
     ApiJson(req): ApiJson<PasteRequest>,
 ) -> AppResult<(StatusCode, Json<PasteResponse>)> {
     if req.text.trim().is_empty() {
         return Err(AppError::BadRequest("text cannot be empty".to_owned()));
     }
-    let response = run(&state.pool, &state.extractor, id, &req.text).await?;
+    let response = run(&ws.pool, &state.extractor, id, &req.text).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -124,7 +126,7 @@ async fn write_results(
     conn: &mut SqliteConnection,
     opportunity_id: i64,
     entry: TimelineEntry,
-    extraction: Extraction,
+    mut extraction: Extraction,
 ) -> AppResult<PasteResponse> {
     let latest_date = extraction
         .latest_date
@@ -136,37 +138,12 @@ async fn write_results(
         entry.id,
         extraction.summary.as_deref().map(str::trim),
         latest_date.as_deref(),
+        extraction.kind.as_deref(),
     )
     .await?;
 
-    let mut proposals = Vec::new();
-    let mut auto_filled = Vec::new();
-    for (field, raw) in [
-        (Field::Company, extraction.company),
-        (Field::ContactName, extraction.contact_name),
-        (Field::ContactEmail, extraction.contact_email),
-        (
-            Field::ValueCents,
-            extraction.value_cents.map(|v| v.to_string()),
-        ),
-        (Field::Stage, extraction.stage),
-        (Field::NextStep, extraction.next_step),
-    ] {
-        // Untrusted output: anything that does not normalize is dropped.
-        let Ok(Some(value)) = field.normalize(raw.as_deref()) else {
-            continue;
-        };
-        // Re-read each time: an earlier auto-fill changed the row.
-        let current = opportunities::fetch(conn, opportunity_id).await?;
-        if current.get(field).is_none() {
-            auto_filled.extend(
-                proposals::set_field(conn, &current, field, Some(&value), Some(entry.id)).await?,
-            );
-        } else {
-            proposals
-                .extend(proposals::propose(conn, &current, field, &value, Some(entry.id)).await?);
-        }
-    }
+    let (proposals, mut auto_filled) =
+        apply_extracted_fields(conn, opportunity_id, entry.id, &mut extraction).await?;
 
     if let Some(latest) = latest_date {
         let current = opportunities::fetch(conn, opportunity_id).await?;
@@ -178,6 +155,7 @@ async fn write_results(
                     Field::LastTouchAt,
                     Some(&latest),
                     Some(entry.id),
+                    None,
                 )
                 .await?,
             );
@@ -210,6 +188,79 @@ async fn write_results(
         suggested_tasks,
         extraction_error: None,
     })
+}
+
+/// Apply every field the extractor found, each with its evidence quote
+/// (when there is one): an empty field is filled in and recorded as an
+/// accepted change, one that already has a different value only gets a
+/// proposal. Takes each field (and its evidence) out of `extraction`,
+/// leaving `tasks` and the rest for the caller.
+async fn apply_extracted_fields(
+    conn: &mut SqliteConnection,
+    opportunity_id: i64,
+    entry_id: i64,
+    extraction: &mut Extraction,
+) -> AppResult<(Vec<FieldChange>, Vec<FieldChange>)> {
+    let evidence = std::mem::take(&mut extraction.evidence);
+    let mut proposals = Vec::new();
+    let mut auto_filled = Vec::new();
+    for (field, raw, field_evidence) in [
+        (Field::Company, extraction.company.take(), evidence.company),
+        (
+            Field::ContactName,
+            extraction.contact_name.take(),
+            evidence.contact_name,
+        ),
+        (
+            Field::ContactEmail,
+            extraction.contact_email.take(),
+            evidence.contact_email,
+        ),
+        (
+            Field::ValueCents,
+            extraction.value_cents.take().map(|v| v.to_string()),
+            evidence.value_cents,
+        ),
+        (Field::Stage, extraction.stage.take(), evidence.stage),
+        (
+            Field::NextStep,
+            extraction.next_step.take(),
+            evidence.next_step,
+        ),
+    ] {
+        // Untrusted output: anything that does not normalize is dropped.
+        let Ok(Some(value)) = field.normalize(raw.as_deref()) else {
+            continue;
+        };
+        // Re-read each time: an earlier auto-fill changed the row.
+        let current = opportunities::fetch(conn, opportunity_id).await?;
+        if current.get(field).is_none() {
+            auto_filled.extend(
+                proposals::set_field(
+                    conn,
+                    &current,
+                    field,
+                    Some(&value),
+                    Some(entry_id),
+                    field_evidence.as_deref(),
+                )
+                .await?,
+            );
+        } else {
+            proposals.extend(
+                proposals::propose(
+                    conn,
+                    &current,
+                    field,
+                    &value,
+                    Some(entry_id),
+                    field_evidence.as_deref(),
+                )
+                .await?,
+            );
+        }
+    }
+    Ok((proposals, auto_filled))
 }
 
 fn is_newer(opportunity: &Opportunity, candidate: &str) -> bool {

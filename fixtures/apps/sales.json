@@ -1,0 +1,805 @@
+{
+  "version": 1,
+  "brand": {
+    "title": "Jack's Sales",
+    "mark": "lula",
+    "chat": {
+      "status": "Building Jack's Sales",
+      "placeholder": "Ask Lula to change this app…"
+    }
+  },
+  "nav": [
+    {
+      "label": "Pipeline",
+      "path": "/"
+    },
+    {
+      "label": "Leads",
+      "path": "/leads"
+    }
+  ],
+  "pages": [
+    {
+      "id": "pipeline",
+      "path": "/",
+      "title": "Pipeline",
+      "header": {
+        "subtitle": {
+          "query": "pipeline_summary",
+          "params": {}
+        },
+        "subtitle_template": "{deal_count} deals across {stage_count} stages",
+        "actions": [
+          "new_deal_form"
+        ]
+      },
+      "layout": {
+        "type": "column",
+        "children": [
+          {
+            "type": "row",
+            "children": [
+              {
+                "type": "component",
+                "component_id": "metric_open_value"
+              },
+              {
+                "type": "component",
+                "component_id": "metric_won_this_month"
+              },
+              {
+                "type": "component",
+                "component_id": "stale_metric"
+              },
+              {
+                "type": "component",
+                "component_id": "metric_suggestions_waiting"
+              }
+            ]
+          },
+          {
+            "type": "component",
+            "component_id": "pipeline_kanban"
+          },
+          {
+            "type": "component",
+            "component_id": "deals_table"
+          },
+          {
+            "type": "component",
+            "component_id": "stale_alerts"
+          },
+          {
+            "type": "component",
+            "component_id": "pipeline_value_chart"
+          }
+        ]
+      },
+      "components": [
+        {
+          "id": "new_deal_form",
+          "type": "form",
+          "title": "New deal",
+          "query": null,
+          "action": {
+            "action": "opportunity.create",
+            "params": {}
+          },
+          "props": {
+            "button_label": "Add deal",
+            "fields": [
+              {
+                "label": "Company",
+                "name": "company",
+                "required": true,
+                "type": "text"
+              },
+              {
+                "label": "Contact",
+                "name": "contact_name",
+                "type": "text"
+              },
+              {
+                "label": "Email",
+                "name": "contact_email",
+                "type": "text"
+              },
+              {
+                "label": "Value",
+                "name": "value_cents",
+                "type": "currency"
+              },
+              {
+                "label": "Next step",
+                "name": "next_step",
+                "type": "text"
+              }
+            ],
+            "trigger_label": "New deal"
+          }
+        },
+        {
+          "id": "metric_open_value",
+          "type": "metric_card",
+          "title": "Open pipeline",
+          "query": {
+            "query": "pipeline_open_value",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "caption_field": "deal_count",
+            "caption_suffix": " deal",
+            "format": "currency_cents",
+            "value_field": "value"
+          }
+        },
+        {
+          "id": "metric_won_this_month",
+          "type": "metric_card",
+          "title": "Won this month",
+          "query": {
+            "query": "pipeline_won_this_month",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "caption_field": "deal_count",
+            "caption_suffix": " deal",
+            "format": "currency_cents",
+            "value_field": "value"
+          }
+        },
+        {
+          "id": "stale_metric",
+          "type": "metric_card",
+          "title": "Needs a touch",
+          "query": {
+            "query": "stale_deals_count",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "accent": true,
+            "caption": "quiet 14+ days or task overdue",
+            "value_field": "value"
+          }
+        },
+        {
+          "id": "metric_suggestions_waiting",
+          "type": "metric_card",
+          "title": "Suggestions waiting",
+          "query": {
+            "query": "pipeline_suggestions_waiting",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "accent": true,
+            "caption_field": "deal_count",
+            "caption_suffix": " deal",
+            "value_field": "value"
+          }
+        },
+        {
+          "id": "pipeline_kanban",
+          "type": "kanban",
+          "title": "Pipeline",
+          "query": {
+            "query": "pipeline_by_stage",
+            "params": {}
+          },
+          "action": {
+            "action": "opportunity.update_stage",
+            "params": {}
+          },
+          "props": {
+            "add_form_id": "new_deal_form",
+            "add_label": "Add deal",
+            "card": {
+              "age_field": "last_touch_at",
+              "closed_field": "last_touch_at",
+              "link": {
+                "page": "deal_detail",
+                "param": "opportunity_id",
+                "param_field": "id"
+              },
+              "next_step_field": "next_step",
+              "open_tasks_field": "open_task_count",
+              "stale_field": "stale",
+              "stale_reason_field": "stale_reason",
+              "subtitle_field": "product",
+              "suggestions_field": "pending_proposal_count",
+              "title_field": "company",
+              "value_field": "value_cents",
+              "value_format": "currency_cents"
+            },
+            "card_title_field": "company",
+            "columns": [
+              {
+                "addable": true,
+                "color": "#968D86",
+                "key": "lead",
+                "label": "Lead"
+              },
+              {
+                "color": "#3F7FD6",
+                "key": "qualified",
+                "label": "Qualified"
+              },
+              {
+                "color": "#E5A228",
+                "key": "proposal",
+                "label": "Proposal"
+              },
+              {
+                "card_variant": "closed",
+                "color": "#2E9E6A",
+                "empty_label": "No deals in Won yet",
+                "key": "won",
+                "label": "Won"
+              },
+              {
+                "card_variant": "closed",
+                "color": "#C2B8AE",
+                "empty_label": "No deals in Lost yet",
+                "key": "lost",
+                "label": "Lost"
+              }
+            ],
+            "group_field": "stage"
+          }
+        },
+        {
+          "id": "deals_table",
+          "type": "table",
+          "title": "Deals",
+          "query": {
+            "query": "deals_table",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "columns": [
+              {
+                "key": "company",
+                "label": "Company"
+              },
+              {
+                "badge_colors": {
+                  "lead": {
+                    "bg": "#F8F1E9",
+                    "dot": "#968D86",
+                    "text": "#6E6966"
+                  },
+                  "lost": {
+                    "bg": "#F8F1E9",
+                    "dot": "#968D86",
+                    "text": "#6E6966"
+                  },
+                  "proposal": {
+                    "bg": "#FCF0D6",
+                    "dot": "#E5A228",
+                    "text": "#8A5E0F"
+                  },
+                  "qualified": {
+                    "bg": "#E3EEFB",
+                    "dot": "#3F7FD6",
+                    "text": "#2A5DA6"
+                  },
+                  "won": {
+                    "bg": "#E3F3EA",
+                    "dot": "#2E9E6A",
+                    "text": "#1F7650"
+                  }
+                },
+                "format": "stage_pill",
+                "key": "stage",
+                "label": "Stage"
+              },
+              {
+                "format": "currency_cents",
+                "key": "value_cents",
+                "label": "Value"
+              },
+              {
+                "key": "next_step",
+                "label": "Next step"
+              },
+              {
+                "format": "relative_date",
+                "key": "last_touch_at",
+                "label": "Last touch"
+              }
+            ],
+            "row_link": {
+              "page": "deal_detail",
+              "param": "opportunity_id",
+              "param_field": "id"
+            }
+          }
+        },
+        {
+          "id": "stale_alerts",
+          "type": "list",
+          "title": "Needs attention",
+          "query": {
+            "query": "stale_deals",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "item": {
+              "link": {
+                "page": "deal_detail",
+                "param": "opportunity_id",
+                "param_field": "id"
+              },
+              "reason_field": "stale_reason",
+              "title_field": "company"
+            }
+          }
+        },
+        {
+          "id": "pipeline_value_chart",
+          "type": "chart",
+          "title": "Pipeline value by stage",
+          "query": {
+            "query": "pipeline_value_by_stage",
+            "params": {}
+          },
+          "action": null,
+          "props": {
+            "chart_type": "bar",
+            "encoding": {
+              "x": "stage",
+              "y": "total_value_cents"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "deal_detail",
+      "path": "/deals/:opportunity_id",
+      "title": "Deal",
+      "layout": {
+        "type": "column",
+        "children": [
+          {
+            "type": "component",
+            "component_id": "deal_detail_view"
+          },
+          {
+            "type": "row",
+            "children": [
+              {
+                "type": "column",
+                "children": [
+                  {
+                    "type": "component",
+                    "component_id": "deal_details_panel"
+                  },
+                  {
+                    "type": "component",
+                    "component_id": "deal_tasks"
+                  },
+                  {
+                    "type": "component",
+                    "component_id": "edit_deal_form"
+                  }
+                ],
+                "width": "320px"
+              },
+              {
+                "type": "column",
+                "children": [
+                  {
+                    "type": "component",
+                    "component_id": "paste_form"
+                  },
+                  {
+                    "type": "component",
+                    "component_id": "deal_proposals"
+                  },
+                  {
+                    "type": "component",
+                    "component_id": "deal_timeline"
+                  }
+                ],
+                "flex": 2
+              }
+            ]
+          }
+        ]
+      },
+      "components": [
+        {
+          "id": "deal_detail_view",
+          "type": "detail_view",
+          "title": null,
+          "query": {
+            "query": "deal_detail",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "action": null,
+          "props": {
+            "actions": [
+              {
+                "action": {
+                  "action": "opportunity.update_stage",
+                  "params": {
+                    "stage": "won"
+                  }
+                },
+                "icon": "check",
+                "label": "Move to Won",
+                "variant": "primary"
+              },
+              {
+                "form_id": "edit_deal_form",
+                "icon": "edit",
+                "label": "Edit",
+                "variant": "secondary"
+              }
+            ],
+            "back_link": {
+              "label": "Pipeline",
+              "path": "/"
+            },
+            "badge_colors": {
+              "lead": {
+                "bg": "#F8F1E9",
+                "dot": "#968D86",
+                "text": "#6E6966"
+              },
+              "lost": {
+                "bg": "#F8F1E9",
+                "dot": "#968D86",
+                "text": "#6E6966"
+              },
+              "proposal": {
+                "bg": "#FCF0D6",
+                "dot": "#E5A228",
+                "text": "#8A5E0F"
+              },
+              "qualified": {
+                "bg": "#E3EEFB",
+                "dot": "#3F7FD6",
+                "text": "#2A5DA6"
+              },
+              "won": {
+                "bg": "#E3F3EA",
+                "dot": "#2E9E6A",
+                "text": "#1F7650"
+              }
+            },
+            "badge_field": "stage",
+            "badge_format": "stage_pill",
+            "display": "header",
+            "meta": [
+              {
+                "field": "contact_name",
+                "icon": "user"
+              },
+              {
+                "field": "last_touch_at",
+                "format": "relative_date",
+                "icon": "clock",
+                "prefix": "Last touch "
+              }
+            ],
+            "title_field": "company"
+          }
+        },
+        {
+          "id": "deal_details_panel",
+          "type": "detail_view",
+          "title": "Details",
+          "query": {
+            "query": "deal_detail",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "action": null,
+          "props": {
+            "display": "panel",
+            "fields": [
+              {
+                "format": "currency_cents",
+                "key": "value_cents",
+                "label": "Value"
+              },
+              {
+                "badge_colors": {
+                  "lead": {
+                    "bg": "#F8F1E9",
+                    "dot": "#968D86",
+                    "text": "#6E6966"
+                  },
+                  "lost": {
+                    "bg": "#F8F1E9",
+                    "dot": "#968D86",
+                    "text": "#6E6966"
+                  },
+                  "proposal": {
+                    "bg": "#FCF0D6",
+                    "dot": "#E5A228",
+                    "text": "#8A5E0F"
+                  },
+                  "qualified": {
+                    "bg": "#E3EEFB",
+                    "dot": "#3F7FD6",
+                    "text": "#2A5DA6"
+                  },
+                  "won": {
+                    "bg": "#E3F3EA",
+                    "dot": "#2E9E6A",
+                    "text": "#1F7650"
+                  }
+                },
+                "format": "stage_pill",
+                "key": "stage",
+                "label": "Stage"
+              },
+              {
+                "key": "next_step",
+                "label": "Next step"
+              },
+              {
+                "key": "contact_name",
+                "label": "Contact"
+              },
+              {
+                "key": "contact_email",
+                "label": "Email"
+              },
+              {
+                "format": "relative_date",
+                "key": "last_touch_at",
+                "label": "Last touch"
+              }
+            ],
+            "menu": [
+              {
+                "form_id": "edit_deal_form",
+                "label": "Edit"
+              }
+            ]
+          }
+        },
+        {
+          "id": "edit_deal_form",
+          "type": "form",
+          "title": "Edit deal",
+          "query": null,
+          "action": {
+            "action": "opportunity.update",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "props": {
+            "button_label": "Save",
+            "fields": [
+              {
+                "label": "Company",
+                "name": "company",
+                "required": true,
+                "type": "text"
+              },
+              {
+                "label": "Contact",
+                "name": "contact_name",
+                "type": "text"
+              },
+              {
+                "label": "Email",
+                "name": "contact_email",
+                "type": "text"
+              },
+              {
+                "label": "Value",
+                "name": "value_cents",
+                "type": "currency"
+              },
+              {
+                "label": "Next step",
+                "name": "next_step",
+                "type": "text"
+              }
+            ],
+            "hide_trigger": true
+          }
+        },
+        {
+          "id": "deal_timeline",
+          "type": "list",
+          "title": "Timeline",
+          "query": {
+            "query": "deal_timeline",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "action": null,
+          "props": {
+            "item": {
+              "date_field": "occurred_at",
+              "kind_field": "kind",
+              "raw_field": "raw_text",
+              "suggestions_field": "suggestion_count",
+              "summary_field": "summary"
+            },
+            "variant": "timeline"
+          }
+        },
+        {
+          "id": "paste_form",
+          "type": "form",
+          "title": "Paste an email thread",
+          "query": null,
+          "action": {
+            "action": "paste.submit",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "props": {
+            "button_label": "Add to deal",
+            "fields": [
+              {
+                "name": "text",
+                "type": "textarea"
+              }
+            ],
+            "helper": "Lula logs it and suggests updates. Nothing changes until you accept.",
+            "placeholder": "Paste an email thread, call notes, or Slack message…"
+          }
+        },
+        {
+          "id": "deal_proposals",
+          "type": "list",
+          "title": "Lula suggests {count} changes",
+          "query": {
+            "query": "deal_proposals",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "action": null,
+          "actions": {
+            "accept": {
+              "action": "proposal.accept",
+              "params": {}
+            },
+            "reject": {
+              "action": "proposal.reject",
+              "params": {}
+            },
+            "unaccept": {
+              "action": "proposal.unaccept",
+              "params": {}
+            },
+            "unreject": {
+              "action": "proposal.unreject",
+              "params": {}
+            }
+          },
+          "props": {
+            "hidden_when_empty": true,
+            "item": {
+              "date_field": "source_date",
+              "evidence_field": "evidence",
+              "field_field": "field",
+              "new_field": "new_value",
+              "old_field": "old_value",
+              "source_field": "source_summary"
+            },
+            "variant": "proposals"
+          }
+        },
+        {
+          "id": "deal_tasks",
+          "type": "list",
+          "title": "To-dos",
+          "query": {
+            "query": "deal_tasks",
+            "params": {
+              "opportunity_id": "$route.opportunity_id"
+            }
+          },
+          "action": null,
+          "actions": {
+            "complete": {
+              "action": "task.complete",
+              "params": {}
+            },
+            "create": {
+              "action": "task.create",
+              "params": {
+                "opportunity_id": "$route.opportunity_id"
+              }
+            }
+          },
+          "props": {
+            "add_label": "Add",
+            "item": {
+              "done_field": "done",
+              "due_field": "due_at",
+              "source_field": "source_entry_id",
+              "title_field": "title"
+            },
+            "variant": "tasks"
+          }
+        }
+      ]
+    },
+    {
+      "id": "lead_queue",
+      "path": "/leads",
+      "title": "Leads",
+      "header": {
+        "subtitle": {
+          "query": "leads_summary",
+          "params": {}
+        },
+        "subtitle_template": "{lead_count} new leads · sorted by fit"
+      },
+      "layout": {
+        "type": "column",
+        "children": [
+          {
+            "type": "component",
+            "component_id": "lead_queue_list"
+          }
+        ]
+      },
+      "components": [
+        {
+          "id": "lead_queue_list",
+          "type": "list",
+          "title": "Lead queue",
+          "query": {
+            "query": "lead_queue",
+            "params": {}
+          },
+          "action": null,
+          "actions": {
+            "accept": {
+              "action": "lead.accept",
+              "params": {}
+            },
+            "reject": {
+              "action": "lead.reject",
+              "params": {}
+            },
+            "snooze": {
+              "action": "lead.snooze",
+              "params": {}
+            }
+          },
+          "props": {
+            "empty": {
+              "body": "Lula checks Illinois filings each night.",
+              "title": "No new leads"
+            },
+            "item": {
+              "category_field": "category",
+              "date_field": "source_date",
+              "reason_field": "fit_reason",
+              "score_field": "fit_score",
+              "source_field": "source",
+              "title_field": "company_name",
+              "website_field": "website"
+            },
+            "variant": "leads"
+          }
+        }
+      ]
+    }
+  ]
+}

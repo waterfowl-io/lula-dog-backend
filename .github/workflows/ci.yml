@@ -5,6 +5,8 @@ on:
     paths:
       - "src/**"
       - "migrations/**"
+      - "schema/**"
+      - "fixtures/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -16,6 +18,8 @@ on:
     paths:
       - "src/**"
       - "migrations/**"
+      - "schema/**"
+      - "fixtures/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -41,6 +45,25 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      # Backs the control-plane tests (`TestApp::with_control`): workspace
+      # membership, app definitions, saved queries, schema catalog. Trust
+      # auth, no password, matching local dev -- this is a throwaway
+      # container, never a real database.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: lula_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_CONTROL_DATABASE_URL: postgres://postgres@localhost:5432/lula_test
     steps:
       - uses: actions/checkout@v4
 
@@ -59,8 +82,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      # SQLite is bundled and every test uses a temp file, so no services are
-      # needed. The xAI extractor is tested against a loopback fake: no key.
+      # SQLite is bundled and every test uses a temp file, so no network is
+      # needed for the data-plane tests. The xAI extractor is tested against
+      # a loopback fake, and JWT verification against a loopback JWKS
+      # server: no key, no real network either way. The `postgres` service
+      # above backs the control-plane tests (workspaces, app definitions,
+      # saved queries, schema catalog); they skip themselves if
+      # TEST_CONTROL_DATABASE_URL is ever unset.
       - name: Test
         run: cargo test --locked
 

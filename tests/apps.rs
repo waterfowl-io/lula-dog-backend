@@ -1,0 +1,399 @@
+//! App definitions: create, version, publish, rollback, and the semantic
+//! validation that rejects a definition before it's ever stored. Gated on
+//! `TEST_CONTROL_DATABASE_URL`: skips with a printed note when it isn't set.
+
+#![expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "a failing assertion aborting the test is the mechanism"
+)]
+
+mod common;
+
+use axum::http::{Method, StatusCode};
+use common::TestApp;
+use serde_json::json;
+use uuid::Uuid;
+
+/// Add `user_id` to `app`'s default workspace with `role`, provisioning
+/// their profile first (membership rows reference `profiles`) -- same
+/// helper as `tests/invites.rs::add_member`, duplicated rather than shared
+/// across integration test crates (each compiles as its own binary).
+async fn add_member(
+    app: &TestApp,
+    user_id: Uuid,
+    role: lula_dog_backend::control::workspaces::Role,
+) {
+    let control = app.control.as_ref().unwrap();
+    lula_dog_backend::control::profiles::upsert_from_jwt(
+        control,
+        user_id,
+        &format!("{user_id}@test.example"),
+    )
+    .await
+    .unwrap();
+    lula_dog_backend::control::workspaces::set_role(control, app.workspace_id, user_id, role)
+        .await
+        .unwrap();
+}
+
+async fn create_a_saved_query(app: &TestApp, key: &str) {
+    let (status, body) = app
+        .post(
+            "/queries",
+            json!({
+                "key": key,
+                "name": key,
+                "description": null,
+                "sql_text": "SELECT 1 AS value",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+fn minimal_definition(query_key: &str) -> serde_json::Value {
+    json!({
+        "version": 1,
+        "pages": [{
+            "id": "home",
+            "path": "/",
+            "title": "Home",
+            "layout": {"type": "component", "component_id": "metric"},
+            "components": [{
+                "id": "metric",
+                "type": "metric_card",
+                "title": "A metric",
+                "query": {"query": query_key, "params": {}},
+                "action": null,
+                "props": {"value_field": "value"}
+            }]
+        }]
+    })
+}
+
+#[tokio::test]
+async fn create_app_version_publish_and_fetch() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_a_saved_query(&app, "a_metric").await;
+
+    let (status, created) = app
+        .post("/apps", json!({"key": "dash", "name": "Dashboard"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let app_id = created["id"].as_str().unwrap();
+
+    let (status, version) = app
+        .post(
+            &format!("/apps/{app_id}/versions"),
+            json!({"definition": minimal_definition("a_metric")}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{version}");
+    assert_eq!(version["version"], 1);
+    let version_id = version["id"].as_str().unwrap();
+
+    let (status, published) = app
+        .post(
+            &format!("/apps/{app_id}/versions/{version_id}/publish"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+    assert_eq!(published["published_version_id"], version_id);
+
+    let (status, detail) = app.get(&format!("/apps/{app_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["version"]["id"], version_id);
+}
+
+#[tokio::test]
+async fn duplicate_app_key_is_a_conflict() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let (status, _) = app
+        .post("/apps", json!({"key": "dup", "name": "One"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = app
+        .post("/apps", json!({"key": "dup", "name": "Two"}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+#[tokio::test]
+async fn version_referencing_an_unknown_saved_query_is_rejected() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let (status, created) = app
+        .post("/apps", json!({"key": "bad", "name": "Bad"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let app_id = created["id"].as_str().unwrap();
+
+    let (status, body) = app
+        .post(
+            &format!("/apps/{app_id}/versions"),
+            json!({"definition": minimal_definition("does_not_exist")}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn version_with_duplicate_component_ids_is_rejected() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_a_saved_query(&app, "dup_metric").await;
+    let (status, created) = app
+        .post("/apps", json!({"key": "dupcomp", "name": "Dup"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let app_id = created["id"].as_str().unwrap();
+
+    let mut definition = minimal_definition("dup_metric");
+    let component = definition["pages"][0]["components"][0].clone();
+    definition["pages"][0]["components"]
+        .as_array_mut()
+        .unwrap()
+        .push(component);
+
+    let (status, body) = app
+        .post(
+            &format!("/apps/{app_id}/versions"),
+            json!({"definition": definition}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn rollback_creates_a_new_version_and_republishes() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_a_saved_query(&app, "rb_metric").await;
+    let (_, created) = app
+        .post("/apps", json!({"key": "rollback", "name": "Rollback"}))
+        .await;
+    let app_id = created["id"].as_str().unwrap();
+
+    let (_, v1) = app
+        .post(
+            &format!("/apps/{app_id}/versions"),
+            json!({"definition": minimal_definition("rb_metric")}),
+        )
+        .await;
+    assert_eq!(v1["version"], 1);
+    app.post(
+        &format!(
+            "/apps/{app_id}/versions/{}/publish",
+            v1["id"].as_str().unwrap()
+        ),
+        json!({}),
+    )
+    .await;
+
+    let mut v2_def = minimal_definition("rb_metric");
+    v2_def["pages"][0]["title"] = json!("Changed");
+    let (_, v2) = app
+        .post(
+            &format!("/apps/{app_id}/versions"),
+            json!({"definition": v2_def}),
+        )
+        .await;
+    assert_eq!(v2["version"], 2);
+    let (status, published) = app
+        .post(
+            &format!(
+                "/apps/{app_id}/versions/{}/publish",
+                v2["id"].as_str().unwrap()
+            ),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+
+    // Roll back to version 1: a new version 3 is created (copying v1's
+    // definition) and published, not a pointer move back to v1 itself.
+    let (status, rolled_back) = app
+        .post(&format!("/apps/{app_id}/rollback"), json!({"version": 1}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{rolled_back}");
+    assert_eq!(rolled_back["version"], 3);
+    assert_eq!(rolled_back["definition"]["pages"][0]["title"], "Home");
+
+    let (status, detail) = app.get(&format!("/apps/{app_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["version"]["version"], 3);
+}
+
+#[tokio::test]
+async fn publish_discard_and_rollback_require_member_or_above() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_a_saved_query(&app, "gate_metric").await;
+    let (_, created) = app
+        .post("/apps", json!({"key": "gated", "name": "Gated"}))
+        .await;
+    let app_id = created["id"].as_str().unwrap();
+    let (_, v1) = app
+        .post(
+            &format!("/apps/{app_id}/versions"),
+            json!({"definition": minimal_definition("gate_metric")}),
+        )
+        .await;
+    let v1_id = v1["id"].as_str().unwrap().to_owned();
+    let (status, published) = app
+        .post(
+            &format!("/apps/{app_id}/versions/{v1_id}/publish"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+    let (_, v2) = app
+        .post(
+            &format!("/apps/{app_id}/versions"),
+            json!({"definition": minimal_definition("gate_metric")}),
+        )
+        .await;
+    let v2_id = v2["id"].as_str().unwrap().to_owned();
+
+    let viewer = Uuid::new_v4();
+    add_member(
+        &app,
+        viewer,
+        lula_dog_backend::control::workspaces::Role::Viewer,
+    )
+    .await;
+    let member = Uuid::new_v4();
+    add_member(
+        &app,
+        member,
+        lula_dog_backend::control::workspaces::Role::Member,
+    )
+    .await;
+
+    // discard: a viewer is refused (v2 is still a draft), a member isn't.
+    let (status, body) = app
+        .request_as(
+            viewer,
+            Method::POST,
+            &format!("/apps/{app_id}/versions/{v2_id}/discard"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = app
+        .request_as(
+            member,
+            Method::POST,
+            &format!("/apps/{app_id}/versions/{v2_id}/discard"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // publish: same split.
+    let (status, body) = app
+        .request_as(
+            viewer,
+            Method::POST,
+            &format!("/apps/{app_id}/versions/{v1_id}/publish"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = app
+        .request_as(
+            member,
+            Method::POST,
+            &format!("/apps/{app_id}/versions/{v1_id}/publish"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // rollback: same split.
+    let (status, body) = app
+        .request_as(
+            viewer,
+            Method::POST,
+            &format!("/apps/{app_id}/rollback"),
+            Some(json!({"version": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = app
+        .request_as(
+            member,
+            Method::POST,
+            &format!("/apps/{app_id}/rollback"),
+            Some(json!({"version": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn app_is_reachable_by_key_or_by_uuid() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_a_saved_query(&app, "key_or_uuid_metric").await;
+    let (status, created) = app
+        .post("/apps", json!({"key": "sales", "name": "Sales"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let app_id = created["id"].as_str().unwrap();
+    app.post(
+        &format!("/apps/{app_id}/versions"),
+        json!({"definition": minimal_definition("key_or_uuid_metric")}),
+    )
+    .await;
+
+    let (status, by_key) = app.get("/apps/sales").await;
+    assert_eq!(status, StatusCode::OK, "{by_key}");
+    assert_eq!(by_key["app"]["id"], app_id);
+
+    let (status, by_uuid) = app.get(&format!("/apps/{app_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{by_uuid}");
+    assert_eq!(by_uuid["app"]["id"], app_id);
+
+    let (status, versions_by_key) = app.get("/apps/sales/versions").await;
+    assert_eq!(status, StatusCode::OK, "{versions_by_key}");
+    assert_eq!(versions_by_key.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unknown_app_key_is_not_found() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let (status, body) = app.get("/apps/does-not-exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn app_key_from_another_workspace_is_not_found() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    app.post("/apps", json!({"key": "cross-ws", "name": "Cross"}))
+        .await;
+
+    let (status, other_ws) = app
+        .post("/workspaces", json!({"name": "Other Workspace"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{other_ws}");
+    let other_ws_id = other_ws["id"].as_str().unwrap();
+
+    let (status, body) = app.get(&format!("/w/{other_ws_id}/apps/cross-ws")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}

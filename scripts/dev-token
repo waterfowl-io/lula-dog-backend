@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Mint a local HS256 bearer token for curl/Bruno/whatever, signed with
+# config/dev.toml's committed dev secret. No network, no identity
+# provider -- matches `auth.mode = "hybrid"` (config/dev.toml's default),
+# which validates this HS256 token AND a real provider's ES256/RS256 token
+# against the same running server. Ported from Desde0's
+# `dev/desde0-test token`.
+#
+# Usage: ./scripts/dev-token [--aal1]
+#   --aal1   mint a token BELOW the aal2 gate (every route 403s except
+#            GET /me), for exercising the "needs a second factor" path.
+#   Overrides via env: JWT_SECRET, JWT_ISS, DEV_USER_ID, DEV_USER_EMAIL.
+#
+# Example:
+#   curl -H "Authorization: Bearer $(./scripts/dev-token)" http://127.0.0.1:3000/me
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+AAL="aal2"
+if [ "${1:-}" = "--aal1" ]; then
+  AAL="aal1"
+fi
+
+[ -f .env ] && set -a && . ./.env && set +a
+
+# The dev user `cargo run -- seed` bootstraps ("Jack's Packaging"), so a
+# token minted with no overrides lines up with the seeded workspace and
+# needs no extra setup.
+JWT_SECRET="${JWT_SECRET:-super-secret-jwt-token-with-at-least-32-characters-long}" \
+JWT_ISS="${JWT_ISS:-http://127.0.0.1:54331/auth/v1}" \
+JWT_SUB="${DEV_USER_ID:-00000000-0000-0000-0000-000000000001}" \
+JWT_EMAIL="${DEV_USER_EMAIL:-jack@lula.dog.example}" \
+JWT_AAL="$AAL" \
+node -e '
+  const crypto = require("crypto");
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    sub: process.env.JWT_SUB,
+    aud: "authenticated",
+    role: "authenticated",
+    iss: process.env.JWT_ISS,
+    email: process.env.JWT_EMAIL,
+    email_verified: true,
+    aal: process.env.JWT_AAL,
+    iat: now,
+    exp: now + 3600,
+  };
+  const data = b64({ alg: "HS256", typ: "JWT" }) + "." + b64(payload);
+  const sig = crypto.createHmac("sha256", process.env.JWT_SECRET).update(data).digest("base64url");
+  process.stdout.write(data + "." + sig);
+'
+echo

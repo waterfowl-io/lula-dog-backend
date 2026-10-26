@@ -158,6 +158,88 @@ async fn accept_applies_and_reject_does_not() {
 }
 
 #[tokio::test]
+async fn proposals_carry_the_evidence_quote_and_a_dismissal_leaves_a_timeline_note() {
+    let app = TestApp::new().await;
+    let id = app
+        .create_opportunity(json!({
+            "company": "Rivet Box Co", "value_cents": 1_000_000, "stage": "qualified",
+        }))
+        .await;
+    let body = paste(&app, id, THREAD).await;
+    let value_proposal = &body["proposals"][0];
+    assert_eq!(value_proposal["field"], "value_cents");
+    assert_eq!(
+        value_proposal["evidence"],
+        "Thanks for the quote. $12,450.00 for 5,000 units works for us."
+    );
+    let stage_id = body["proposals"][1]["id"].as_i64().unwrap();
+
+    let (status, rejected) = app
+        .post(&format!("/proposals/{stage_id}/reject"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rejected["status"], "rejected");
+
+    let (_, detail) = app.get(&format!("/opportunities/{id}")).await;
+    let timeline = detail["timeline"].as_array().unwrap();
+    assert!(
+        timeline
+            .iter()
+            .any(|e| e["raw_text"].as_str()
+                == Some("Dismissed 1 suggestion from Re: 12x10x8 RSC quote")),
+        "{timeline:?}"
+    );
+}
+
+#[tokio::test]
+async fn unreject_and_unaccept_undo_within_the_window() {
+    let app = TestApp::new().await;
+    let id = app
+        .create_opportunity(json!({
+            "company": "Rivet Box Co", "value_cents": 1_000_000, "stage": "qualified",
+        }))
+        .await;
+    let body = paste(&app, id, THREAD).await;
+    let value_id = body["proposals"][0]["id"].as_i64().unwrap();
+    let stage_id = body["proposals"][1]["id"].as_i64().unwrap();
+
+    // Undo a reject.
+    app.post(&format!("/proposals/{stage_id}/reject"), json!({}))
+        .await;
+    let (status, undone) = app
+        .post(&format!("/proposals/{stage_id}/unreject"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{undone}");
+    assert_eq!(undone["status"], "proposed");
+    // Undoing an already-proposed (not rejected) change is a conflict.
+    let (status, _) = app
+        .post(&format!("/proposals/{stage_id}/unreject"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Undo an accept.
+    app.post(&format!("/proposals/{value_id}/accept"), json!({}))
+        .await;
+    let (status, undone) = app
+        .post(&format!("/proposals/{value_id}/unaccept"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{undone}");
+    assert_eq!(undone["status"], "proposed");
+    let (_, detail) = app.get(&format!("/opportunities/{id}")).await;
+    assert_eq!(detail["opportunity"]["value_cents"], 1_000_000);
+
+    // Re-accept, change the field again directly, then the old undo is a conflict.
+    app.post(&format!("/proposals/{value_id}/accept"), json!({}))
+        .await;
+    app.patch(&format!("/opportunities/{id}"), json!({"value_cents": 999}))
+        .await;
+    let (status, _) = app
+        .post(&format!("/proposals/{value_id}/unaccept"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn accept_all_and_dismiss_all() {
     let app = TestApp::new().await;
     let a = app

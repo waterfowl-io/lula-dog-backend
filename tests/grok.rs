@@ -53,6 +53,7 @@ fn opportunity() -> Opportunity {
         stage: Stage::Qualified,
         next_step: None,
         last_touch_at: None,
+        product: None,
         created_at: "2026-10-01 00:00:00".to_owned(),
         updated_at: "2026-10-01 00:00:00".to_owned(),
     }
@@ -95,6 +96,7 @@ async fn sends_a_structured_output_request_and_parses_the_reply() {
         "stage": "proposal",
         "next_step": "Send double-wall option",
         "latest_date": "2026-10-14T09:30:00-07:00",
+        "kind": "email",
         "tasks": [{"title": "Send pricing", "due_at": "2026-10-17"}],
     });
     let seen = Arc::new(Mutex::new(None));
@@ -108,6 +110,7 @@ async fn sends_a_structured_output_request_and_parses_the_reply() {
     assert_eq!(got.contact_name.as_deref(), Some("Dana Ortiz"));
     assert_eq!(got.value_cents, Some(1_245_000));
     assert_eq!(got.stage.as_deref(), Some("proposal"));
+    assert_eq!(got.kind.as_deref(), Some("email"));
     assert_eq!(got.tasks.len(), 1);
 
     let (headers, body) = seen.lock().unwrap().clone().unwrap();
@@ -117,7 +120,7 @@ async fn sends_a_structured_output_request_and_parses_the_reply() {
     assert_eq!(body["response_format"]["json_schema"]["strict"], true);
     let schema = &body["response_format"]["json_schema"]["schema"];
     assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["required"].as_array().unwrap().len(), 9);
+    assert_eq!(schema["required"].as_array().unwrap().len(), 11);
     let user: Value =
         serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(user["today"], "2026-10-23");

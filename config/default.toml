@@ -1,0 +1,34 @@
+# Base config, layered under config/{APP_ENV}.toml -> env (APP__SECTION__KEY)
+# -> config/local.toml (gitignored). See src/config.rs and
+# docs/architecture.md. Only [server]/[database]/[auth] go through this
+# loader; every other setting (DATA_DIR, EXTRACTOR, CHAT_*, ...) is still a
+# plain env var, read directly in Config::from_env.
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# Comma-separated allowlist for CORS (no credentials/cookies: bearer-token
+# API). Override with APP__SERVER__CORS_ORIGINS.
+cors_origins = "https://app.lula.dog,http://localhost:5173"
+
+# The control-plane Postgres URL. Empty disables workspace-membership
+# enforcement (every workspace id is accessible as `owner`) -- fine for
+# local/single-tenant use, never for production. Override with
+# APP__DATABASE__URL, or the bare DATABASE_URL env var (both are canonical;
+# see Config::from_env for how a sqlite: DATABASE_URL -- the old per-
+# workspace path, now DATA_DIR-only -- is told apart and ignored).
+[database]
+url = ""
+
+# A generic OIDC bearer-token verifier: an issuer, an audience, and where
+# the signing keys live. `jwks` (the default) fetches ES256/RS256 public
+# keys from a JWKS URL -- any real provider (Supabase included). `hs256` is
+# a shared secret for local/test. `hybrid` configures both, dispatching per
+# token by its header `alg`. `dev` bypasses verification entirely (every
+# request is auth.dev_user_id, overridable with `X-Dev-User`); refused at
+# boot when APP_ENV=prod.
+[auth]
+mode = "jwks"
+jwks_url = ""
+issuer = ""
+audience = "authenticated"

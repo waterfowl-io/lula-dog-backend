@@ -5,15 +5,15 @@
 //! through `apply` and leave a `field_changes` row behind.
 
 use axum::Json;
-use axum::extract::State;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqliteConnection};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 
-use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::extract::ApiPath;
+use crate::extract::{ApiPath, IdPath};
 use crate::opportunities::{self, Opportunity, OpportunityView, Stage};
+use crate::timeline;
+use crate::workspace_db::WorkspaceContext;
 
 /// An opportunity field that a change can target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
@@ -108,6 +108,11 @@ pub struct FieldChange {
     pub old_value: Option<String>,
     pub new_value: Option<String>,
     pub status: ChangeStatus,
+    /// The quote from the source text the extractor based this on, when it
+    /// found one (e.g. `"Could you also quote SKU 3 in 32 ECT?"`). `null`
+    /// for direct edits and for fields the extractor set with no single
+    /// quotable line.
+    pub evidence: Option<String>,
     pub created_at: String,
 }
 
@@ -117,12 +122,13 @@ async fn record(
     field: Field,
     new_value: Option<&str>,
     entry_id: Option<i64>,
+    evidence: Option<&str>,
     status: ChangeStatus,
 ) -> AppResult<FieldChange> {
     Ok(sqlx::query_as::<_, FieldChange>(
         "INSERT INTO field_changes
-           (opportunity_id, entry_id, field, old_value, new_value, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+           (opportunity_id, entry_id, field, old_value, new_value, status, evidence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          RETURNING *",
     )
     .bind(opportunity.id)
@@ -131,6 +137,7 @@ async fn record(
     .bind(opportunity.get(field))
     .bind(new_value)
     .bind(status)
+    .bind(evidence)
     .fetch_one(conn)
     .await?)
 }
@@ -164,6 +171,7 @@ pub async fn set_field(
     field: Field,
     value: Option<&str>,
     entry_id: Option<i64>,
+    evidence: Option<&str>,
 ) -> AppResult<Option<FieldChange>> {
     if opportunity.get(field).as_deref() == value {
         return Ok(None);
@@ -175,6 +183,7 @@ pub async fn set_field(
         field,
         value,
         entry_id,
+        evidence,
         ChangeStatus::Accepted,
     )
     .await?;
@@ -190,6 +199,7 @@ pub async fn propose(
     field: Field,
     value: &str,
     entry_id: Option<i64>,
+    evidence: Option<&str>,
 ) -> AppResult<Option<FieldChange>> {
     if opportunity.get(field).as_deref() == Some(value) {
         return Ok(None);
@@ -212,6 +222,7 @@ pub async fn propose(
         field,
         Some(value),
         entry_id,
+        evidence,
         ChangeStatus::Proposed,
     )
     .await?;
@@ -257,6 +268,38 @@ async fn resolve(conn: &mut SqliteConnection, id: i64, to: ChangeStatus) -> AppR
     }))
 }
 
+/// Write one timeline note per source entry for a batch of just-rejected
+/// changes, e.g. "Dismissed 2 suggestions from Re: Double-wall 24x18x18
+/// proposal" -- so dismissing leaves a record, not silence.
+async fn write_dismissal_notes(
+    conn: &mut SqliteConnection,
+    opportunity_id: i64,
+    rejected: &[FieldChange],
+) -> AppResult<()> {
+    let mut by_entry: std::collections::BTreeMap<Option<i64>, usize> =
+        std::collections::BTreeMap::new();
+    for change in rejected {
+        *by_entry.entry(change.entry_id).or_insert(0) += 1;
+    }
+    for (entry_id, count) in by_entry {
+        let noun = if count == 1 {
+            "suggestion"
+        } else {
+            "suggestions"
+        };
+        let source = match entry_id {
+            Some(id) => timeline::summary_or_raw(conn, id).await?,
+            None => None,
+        };
+        let note = source.map_or_else(
+            || format!("Dismissed {count} {noun}"),
+            |summary| format!("Dismissed {count} {noun} from {summary}"),
+        );
+        timeline::insert(conn, opportunity_id, &note).await?;
+    }
+    Ok(())
+}
+
 async fn accept_one(conn: &mut SqliteConnection, id: i64) -> AppResult<FieldChange> {
     let change = resolve(conn, id, ChangeStatus::Accepted).await?;
     // Re-validated on the way in, in case the row was written by something
@@ -278,8 +321,8 @@ pub struct AcceptResponse {
 /// Accept a proposal and apply its value to the opportunity.
 #[utoipa::path(
     post,
-    path = "/proposals/{id}/accept",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/proposals/{id}/accept",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = AcceptResponse),
         (status = 404, body = crate::error::ErrorBody),
@@ -288,24 +331,31 @@ pub struct AcceptResponse {
     tag = "proposals"
 )]
 pub async fn accept(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<AcceptResponse>> {
-    let mut tx = state.pool.begin().await?;
+    Ok(Json(accept_via_pool(&ws.pool, id).await?))
+}
+
+/// `accept`'s logic, from a pool rather than a borrowed transaction -- the
+/// one entry point both the HTTP handler and `crate::actions::dispatch`
+/// (chat's `proposal.accept` tool) call. Undo reuses `unaccept_via_pool`.
+pub async fn accept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<AcceptResponse> {
+    let mut tx = pool.begin().await?;
     let proposal = accept_one(&mut tx, id).await?;
     let opportunity = opportunities::fetch_view(&mut tx, proposal.opportunity_id).await?;
     tx.commit().await?;
-    Ok(Json(AcceptResponse {
+    Ok(AcceptResponse {
         proposal,
         opportunity,
-    }))
+    })
 }
 
 /// Reject a proposal. The opportunity is unchanged.
 #[utoipa::path(
     post,
-    path = "/proposals/{id}/reject",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/proposals/{id}/reject",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = FieldChange),
         (status = 404, body = crate::error::ErrorBody),
@@ -314,11 +364,136 @@ pub async fn accept(
     tag = "proposals"
 )]
 pub async fn reject(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<FieldChange>> {
-    let mut conn = state.pool.acquire().await?;
-    Ok(Json(resolve(&mut conn, id, ChangeStatus::Rejected).await?))
+    Ok(Json(reject_via_pool(&ws.pool, id).await?))
+}
+
+/// `reject`'s logic, from a pool rather than a borrowed transaction -- the
+/// one entry point both the HTTP handler and `crate::actions::dispatch`
+/// (chat's `proposal.reject` tool) call. Undo reuses `unreject_via_pool`.
+pub async fn reject_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
+    let mut tx = pool.begin().await?;
+    let change = resolve(&mut tx, id, ChangeStatus::Rejected).await?;
+    write_dismissal_notes(
+        &mut tx,
+        change.opportunity_id,
+        std::slice::from_ref(&change),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(change)
+}
+
+/// Undo a just-rejected proposal within the frontend's short "Undo" window,
+/// putting it back to `proposed`. Refuses (409) once something else has
+/// resolved it again, so it can never resurrect a stale decision.
+#[utoipa::path(
+    post,
+    path = "/w/{workspace_id}/proposals/{id}/unreject",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
+    responses(
+        (status = 200, body = FieldChange),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 409, description = "No longer rejected", body = crate::error::ErrorBody),
+    ),
+    tag = "proposals"
+)]
+pub async fn unreject(
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
+) -> AppResult<Json<FieldChange>> {
+    Ok(Json(unreject_via_pool(&ws.pool, id).await?))
+}
+
+/// `unreject`'s logic, from a pool rather than a borrowed connection -- the
+/// one entry point both the HTTP handler and chat's undo endpoint (reversing
+/// a `proposal.reject` tool call) call.
+pub async fn unreject_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
+    let mut conn = pool.acquire().await?;
+    let claimed = sqlx::query_as::<_, FieldChange>(
+        "UPDATE field_changes SET status = 'proposed'
+         WHERE id = ?1 AND status = 'rejected'
+         RETURNING *",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(change) = claimed {
+        return Ok(change);
+    }
+    let existing: Option<ChangeStatus> =
+        sqlx::query_scalar("SELECT status FROM field_changes WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Err(existing.map_or(AppError::NotFound("proposal"), |status| {
+        AppError::Conflict(format!(
+            "proposal {id} is no longer rejected (now {})",
+            status.as_str()
+        ))
+    }))
+}
+
+/// Undo a just-accepted proposal within the frontend's short "Undo" window:
+/// puts the field back to `old_value` and the change back to `proposed`.
+/// Refuses (409) if the opportunity's field no longer holds the value this
+/// change applied -- something else changed it since, so undoing here would
+/// clobber that instead of this accept.
+#[utoipa::path(
+    post,
+    path = "/w/{workspace_id}/proposals/{id}/unaccept",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
+    responses(
+        (status = 200, body = FieldChange),
+        (status = 404, body = crate::error::ErrorBody),
+        (status = 409, description = "Not accepted, or changed again since", body = crate::error::ErrorBody),
+    ),
+    tag = "proposals"
+)]
+pub async fn unaccept(
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
+) -> AppResult<Json<FieldChange>> {
+    Ok(Json(unaccept_via_pool(&ws.pool, id).await?))
+}
+
+/// `unaccept`'s logic, from a pool rather than a borrowed transaction -- the
+/// one entry point both the HTTP handler and chat's undo endpoint (reversing
+/// a `proposal.accept` tool call) call.
+pub async fn unaccept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
+    let mut tx = pool.begin().await?;
+    let change: FieldChange = sqlx::query_as("SELECT * FROM field_changes WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound("proposal"))?;
+    if change.status != ChangeStatus::Accepted {
+        return Err(AppError::Conflict(format!("proposal {id} is not accepted")));
+    }
+    let opportunity = opportunities::fetch(&mut tx, change.opportunity_id).await?;
+    if opportunity.get(change.field).as_deref() != change.new_value.as_deref() {
+        return Err(AppError::Conflict(format!(
+            "proposal {id} can't be undone: the field changed again since it was accepted"
+        )));
+    }
+    apply(
+        &mut tx,
+        change.opportunity_id,
+        change.field,
+        change.old_value.as_deref(),
+    )
+    .await?;
+    let reverted = sqlx::query_as::<_, FieldChange>(
+        "UPDATE field_changes SET status = 'proposed' WHERE id = ?1 AND status = 'accepted' RETURNING *",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::Conflict(format!("proposal {id} is no longer accepted")))?;
+    tx.commit().await?;
+    Ok(reverted)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -332,8 +507,8 @@ pub struct AcceptAllResponse {
 /// Accept every pending proposal on an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities/{id}/proposals/accept-all",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}/proposals/accept-all",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = AcceptAllResponse),
         (status = 404, body = crate::error::ErrorBody),
@@ -341,10 +516,10 @@ pub struct AcceptAllResponse {
     tag = "proposals"
 )]
 pub async fn accept_all(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<AcceptAllResponse>> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = ws.pool.begin().await?;
     opportunities::fetch(&mut tx, id).await?;
     let mut accepted = Vec::new();
     for pending in pending_for(&mut tx, id).await? {
@@ -366,8 +541,8 @@ pub struct DismissAllResponse {
 /// Reject every pending proposal on an opportunity.
 #[utoipa::path(
     post,
-    path = "/opportunities/{id}/proposals/dismiss-all",
-    params(("id" = i64, Path)),
+    path = "/w/{workspace_id}/opportunities/{id}/proposals/dismiss-all",
+    params(("workspace_id" = Uuid, Path), ("id" = i64, Path)),
     responses(
         (status = 200, body = DismissAllResponse),
         (status = 404, body = crate::error::ErrorBody),
@@ -375,10 +550,10 @@ pub struct DismissAllResponse {
     tag = "proposals"
 )]
 pub async fn dismiss_all(
-    State(state): State<AppState>,
-    ApiPath(id): ApiPath<i64>,
+    ws: WorkspaceContext,
+    ApiPath(IdPath { id }): ApiPath<IdPath>,
 ) -> AppResult<Json<DismissAllResponse>> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = ws.pool.begin().await?;
     opportunities::fetch(&mut tx, id).await?;
     let rejected = sqlx::query_as::<_, FieldChange>(
         "UPDATE field_changes SET status = 'rejected'
@@ -388,6 +563,7 @@ pub async fn dismiss_all(
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
+    write_dismissal_notes(&mut tx, id, &rejected).await?;
     tx.commit().await?;
     Ok(Json(DismissAllResponse { rejected }))
 }

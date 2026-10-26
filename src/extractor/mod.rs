@@ -39,8 +39,37 @@ pub struct Extraction {
     /// The most recent date in the thread, any format `time::normalize`
     /// accepts.
     pub latest_date: Option<String>,
+    /// What kind of contact this was: `"email"`, `"call"` or `"quote"`.
+    /// `None` when the text doesn't clearly say (shown as "Note").
+    pub kind: Option<String>,
     #[serde(default)]
     pub tasks: Vec<SuggestedTask>,
+    /// The source quote behind each field above, when the extractor can
+    /// point to one. Keyed the same way the fields are named here, not by
+    /// `proposals::Field`'s column names, since `contact_name` and
+    /// `contact_email` usually share one quote (the `From:` line).
+    #[serde(default)]
+    pub evidence: Evidence,
+}
+
+/// Per-field evidence quotes, parallel to `Extraction`'s proposable fields
+/// (everything except `summary`, `latest_date` and `tasks`, which aren't
+/// proposals).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evidence {
+    #[serde(default)]
+    pub company: Option<String>,
+    #[serde(default)]
+    pub contact_name: Option<String>,
+    #[serde(default)]
+    pub contact_email: Option<String>,
+    #[serde(default)]
+    pub value_cents: Option<String>,
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub next_step: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

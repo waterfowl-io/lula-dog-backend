@@ -1,0 +1,381 @@
+{
+  "$defs": {
+    "ActionBinding": {
+      "description": "A write binding to a named action from `KNOWN_ACTIONS`.",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "Brand": {
+      "properties": {
+        "chat": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatBrand"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mark": {
+          "description": "A named mark/logo id the frontend knows how to render (e.g.\n`\"lula\"`); unrecognized values just render no mark.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
+    "ChatBrand": {
+      "description": "Copy for the chat panel's static shell. There is no live agent behind\nit -- this only customizes the header status line and composer\nplaceholder text, not conversation content.",
+      "properties": {
+        "placeholder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Component": {
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "A single write binding, for components that only ever need one\n(a kanban's drag action, a single-button form). Mutually usable\nalongside `actions` below; `all_actions` sees both."
+        },
+        "actions": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ActionBinding"
+          },
+          "description": "Named write bindings, for components that offer more than one verb\non a row -- e.g. a proposal list's `accept`/`reject`, a lead list's\n`accept`/`reject`/`snooze`. Keys are an app author's choice of label\nfor each button; the frontend decides presentation per key, this is\njust storage and validation.",
+          "type": "object"
+        },
+        "id": {
+          "type": "string"
+        },
+        "props": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Component-specific configuration: chart `chart_type`/`encoding`,\ntable `columns`, form `fields`, kanban `group_field`, etc. --\ndeliberately open-ended so the fixed `ComponentKind`s don't need a\nbespoke shape each; `validate` checks the few fields that matter for\nbinding safety per kind.",
+          "type": "object"
+        },
+        "query": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueryBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/ComponentKind"
+        }
+      },
+      "required": [
+        "id",
+        "type"
+      ],
+      "type": "object"
+    },
+    "ComponentKind": {
+      "description": "The fixed component library.",
+      "enum": [
+        "table",
+        "chart",
+        "metric_card",
+        "form",
+        "kanban",
+        "detail_view",
+        "list"
+      ],
+      "type": "string"
+    },
+    "LayoutNode": {
+      "description": "Layout primitives. A `component` leaf names one of `Page::components` by\nid; the component itself carries no layout information.",
+      "oneOf": [
+        {
+          "properties": {
+            "children": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/LayoutNode"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "row",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "children": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/LayoutNode"
+              },
+              "type": "array"
+            },
+            "flex": {
+              "description": "A flex-grow factor relative to sibling columns in the same row\nthat also set one (both default to `1` otherwise).",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "column",
+              "type": "string"
+            },
+            "width": {
+              "description": "A fixed CSS width (e.g. `\"320px\"`), for a column that shouldn't\ngrow with its siblings -- a narrow details rail beside a wider\nactivity column, say.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "children": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/LayoutNode"
+              },
+              "type": "array"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "section",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "component_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "component",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "component_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "NavItem": {
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "path": {
+          "description": "Must equal some page's `path` exactly.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "path"
+      ],
+      "type": "object"
+    },
+    "Page": {
+      "properties": {
+        "components": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Component"
+          },
+          "type": "array"
+        },
+        "header": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PageHeader"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional subtitle and inline actions rendered on the title row,\ninstead of `title` standing alone. A page that doesn't author one\njust gets the bare `title`."
+        },
+        "id": {
+          "type": "string"
+        },
+        "layout": {
+          "$ref": "#/$defs/LayoutNode"
+        },
+        "path": {
+          "description": "E.g. `/opportunities/:opportunity_id`; segments starting with `:`\nare route params a binding can reference as `$route.<name>`.",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "path",
+        "title",
+        "layout"
+      ],
+      "type": "object"
+    },
+    "PageHeader": {
+      "properties": {
+        "actions": {
+          "description": "Ids of this page's own `components`, rendered inline on the title\nrow (e.g. a \"New deal\" form's trigger button) instead of in\n`layout`'s normal flow. Each must still be one of the page's\n`components`; it is simply not also placed in `layout`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "subtitle": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueryBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A query whose first row fills `subtitle_template`'s `{field}`\ntokens, e.g. `\"{deal_count} deals across {stage_count} stages\"`."
+        },
+        "subtitle_template": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "QueryBinding": {
+      "description": "A read binding to a saved query, by key, within the owning workspace.",
+      "properties": {
+        "params": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Named params passed to the query when it runs. A value of\n`\"$route.<name>\"` is substituted with the page's route param of\nthat name at request time; any other value is passed through.",
+          "type": "object"
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "brand": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Brand"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "App-level branding: display name, mark, and the (static -- no live\nagent) chat shell's copy. Optional so a minimal app definition\ndoesn't need to author it."
+    },
+    "nav": {
+      "description": "Top-level navigation links, rendered in the top bar. Each `path`\nmust equal some page's `path`.",
+      "items": {
+        "$ref": "#/$defs/NavItem"
+      },
+      "type": "array"
+    },
+    "pages": {
+      "items": {
+        "$ref": "#/$defs/Page"
+      },
+      "type": "array"
+    },
+    "version": {
+      "description": "The app definition schema format version (not the app's own\nversion number, which is `app_definition_versions.version`).",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "pages"
+  ],
+  "title": "AppDefinitionDoc",
+  "type": "object"
+}
