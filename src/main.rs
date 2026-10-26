@@ -63,7 +63,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     };
     let extractor = extractor_from_config(&config.extractor)?;
     let auth = Arc::new(Auth::from_config(&config.auth)?);
-    let workspaces = WorkspaceRegistry::new(config.data_dir.clone(), config.database_url.clone());
+    let workspaces = WorkspaceRegistry::new(config.data_dir.clone());
     let chat_provider =
         lula_dog_backend::chat::provider::provider_from_config(&config.chat.provider)?;
     let build_agent =
@@ -78,6 +78,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         chat: config.chat.clone(),
         chat_provider,
         build_agent,
+        cors_origins: config.server.cors_origins_list(),
     });
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
@@ -123,7 +124,7 @@ fn workspace_id_flag(flags: &Flags<'_>) -> anyhow::Result<Uuid> {
 }
 
 async fn workspace_pool(config: &Config, workspace_id: Uuid) -> anyhow::Result<SqlitePool> {
-    let registry = WorkspaceRegistry::new(config.data_dir.clone(), config.database_url.clone());
+    let registry = WorkspaceRegistry::new(config.data_dir.clone());
     registry.get_or_create(workspace_id).await
 }
 

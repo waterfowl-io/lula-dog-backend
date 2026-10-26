@@ -9,6 +9,7 @@
 //! (later). See `docs/architecture.md`.
 
 pub mod app_definitions;
+pub mod invites;
 pub mod profiles;
 pub mod saved_queries;
 pub mod schema_catalog;

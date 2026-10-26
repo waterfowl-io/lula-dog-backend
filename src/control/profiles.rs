@@ -19,18 +19,11 @@ pub struct Profile {
 }
 
 /// Ensure a profile exists for a verified JWT's `(id, email)`, refreshing
-/// the email if it changed. Also best-effort upserts the local `auth.users`
-/// shim so the `profiles` FK is satisfiable; a real Supabase project
-/// already has that row (managed by GoTrue) and the backend's role may not
-/// have write access to it, so a failure there is swallowed.
+/// the email if it changed. `profiles.id` carries no foreign key (see
+/// `migrations/control/0001_control_plane.sql`): this service verifies
+/// identity itself and connects to Postgres directly, so there is no
+/// Supabase-managed `auth.users` row for it to reference.
 pub async fn upsert_from_jwt(pool: &ControlPool, id: Uuid, email: &str) -> AppResult<Profile> {
-    let _ = sqlx::query(
-        "INSERT INTO auth.users (id, email) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
-    )
-    .bind(id)
-    .bind(email)
-    .execute(pool)
-    .await;
     Ok(sqlx::query_as::<_, Profile>(
         "INSERT INTO profiles (id, email) VALUES ($1, $2)
          ON CONFLICT (id) DO UPDATE SET email = $2, updated_at = now()

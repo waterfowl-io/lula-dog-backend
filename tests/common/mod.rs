@@ -25,7 +25,7 @@ use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use lula_dog_backend::auth::Auth;
 use lula_dog_backend::chat::provider::provider_from_config;
-use lula_dog_backend::config::{AuthMode, ChatConfig, ChatProviderConfig};
+use lula_dog_backend::config::{AuthConfig, AuthMode, ChatConfig, ChatProviderConfig};
 use lula_dog_backend::control::{self, ControlPool};
 use lula_dog_backend::extractor::{Extractor, StubExtractor};
 use lula_dog_backend::workspace_db::WorkspaceRegistry;
@@ -53,6 +53,16 @@ pub fn default_chat_config() -> ChatConfig {
 /// Routes with no `/w/{workspace_id}` prefix.
 const PUBLIC_PATHS: &[&str] = &["/health", "/openapi.json", "/app-definition.schema.json"];
 
+/// `auth.mode = "dev"` for `default_user_id`, matching `Config`'s own
+/// default (aud `authenticated`, no provider).
+pub fn dev_auth_config(default_user_id: Uuid) -> AuthConfig {
+    AuthConfig {
+        mode: AuthMode::Dev,
+        dev_user_id: default_user_id,
+        ..AuthConfig::default()
+    }
+}
+
 pub struct TestApp {
     pub router: Router,
     /// The default test workspace's SQLite pool.
@@ -76,19 +86,17 @@ impl TestApp {
         Self::build(
             extractor,
             None,
-            AuthMode::Dev {
-                default_user_id: dev_user_id,
-            },
+            dev_auth_config(dev_user_id),
             default_chat_config(),
         )
         .await
     }
 
-    /// With a given `AuthMode` (e.g. `Supabase` pointed at a loopback JWKS
-    /// server) and no control plane, so only the auth layer is exercised:
-    /// every workspace id is accessible as `owner` regardless of who the
-    /// token says the caller is.
-    pub async fn with_auth_mode(auth_mode: AuthMode) -> Self {
+    /// With a given `AuthConfig` (e.g. `oidc`/hybrid pointed at a loopback
+    /// JWKS server) and no control plane, so only the auth layer is
+    /// exercised: every workspace id is accessible as `owner` regardless
+    /// of who the token says the caller is.
+    pub async fn with_auth_mode(auth_mode: AuthConfig) -> Self {
         Self::build(
             Arc::new(StubExtractor),
             None,
@@ -105,9 +113,7 @@ impl TestApp {
         Self::build(
             Arc::new(StubExtractor),
             None,
-            AuthMode::Dev {
-                default_user_id: dev_user_id,
-            },
+            dev_auth_config(dev_user_id),
             chat,
         )
         .await
@@ -143,9 +149,7 @@ impl TestApp {
         let mut app = Self::build(
             Arc::new(StubExtractor),
             Some(control),
-            AuthMode::Dev {
-                default_user_id: dev_user_id,
-            },
+            dev_auth_config(dev_user_id),
             chat,
         )
         .await;
@@ -157,17 +161,16 @@ impl TestApp {
     async fn build(
         extractor: Arc<dyn Extractor>,
         control: Option<ControlPool>,
-        auth_mode: AuthMode,
+        auth_mode: AuthConfig,
         chat: ChatConfig,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let legacy_url = format!("sqlite://{}", dir.path().join("legacy.db").display());
-        let workspaces = WorkspaceRegistry::new(dir.path().to_path_buf(), legacy_url);
+        let workspaces = WorkspaceRegistry::new(dir.path().to_path_buf());
         let workspace_id = Uuid::new_v4();
         let pool = workspaces.get_or_create(workspace_id).await.unwrap();
-        let dev_user_id = match &auth_mode {
-            AuthMode::Dev { default_user_id } => *default_user_id,
-            AuthMode::Supabase { .. } => Uuid::nil(),
+        let dev_user_id = match auth_mode.mode {
+            AuthMode::Dev => auth_mode.dev_user_id,
+            _ => Uuid::nil(),
         };
         let auth = Arc::new(Auth::from_config(&auth_mode).unwrap());
         let chat_provider = provider_from_config(&chat.provider).unwrap();
@@ -183,6 +186,10 @@ impl TestApp {
             chat,
             chat_provider,
             build_agent,
+            cors_origins: vec![
+                "https://app.lula.dog".to_owned(),
+                "http://localhost:5173".to_owned(),
+            ],
         };
         let router = router(state);
         Self {
@@ -248,6 +255,26 @@ impl TestApp {
             &[("authorization", &format!("Bearer {token}"))],
         )
         .await
+    }
+
+    /// Like `request_with_headers`, but returns the raw response so a
+    /// caller can inspect response headers (e.g. CORS) that the
+    /// JSON-decoding helpers below throw away.
+    pub async fn raw_request(
+        &self,
+        method: Method,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method(method).uri(self.full_path(path));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        self.router
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
     }
 
     pub async fn request_with_headers(

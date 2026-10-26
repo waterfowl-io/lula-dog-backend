@@ -2,12 +2,12 @@
 //! the `/w/{workspace_id}/...` middleware + extractor that resolve a
 //! request into one.
 //!
-//! Membership is normally resolved from the control plane (Postgres); if
-//! `CONTROL_DATABASE_URL` is not configured, every workspace id is treated
-//! as accessible with the `owner` role -- a deliberate, documented bypass
-//! (see `docs/architecture.md`) so the data plane and its tests work
-//! without standing up Postgres, the same way `AUTH_MODE=dev` bypasses JWT
-//! verification.
+//! Membership is normally resolved from the control plane (Postgres); if no
+//! control-plane URL is configured (`Config::control_database_url`), every
+//! workspace id is treated as accessible with the `owner` role -- a
+//! deliberate, documented bypass (see `docs/architecture.md`) so the data
+//! plane and its tests work without standing up Postgres, the same way
+//! `auth.mode = "dev"` bypasses JWT verification.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,18 +32,13 @@ use crate::error::{AppError, AppResult};
 #[derive(Clone)]
 pub struct WorkspaceRegistry {
     data_dir: PathBuf,
-    /// `crate::config::DEFAULT_WORKSPACE_ID` connects to this URL directly
-    /// (normally `DATABASE_URL`) instead of a `data_dir` path, so a
-    /// pre-step-3 single-tenant setup keeps reading the same file.
-    legacy_default_url: String,
     pools: Arc<Mutex<HashMap<Uuid, SqlitePool>>>,
 }
 
 impl WorkspaceRegistry {
-    pub fn new(data_dir: impl Into<PathBuf>, legacy_default_url: impl Into<String>) -> Self {
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
-            legacy_default_url: legacy_default_url.into(),
             pools: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -53,11 +48,7 @@ impl WorkspaceRegistry {
     }
 
     fn url_for(&self, id: Uuid) -> String {
-        if id == crate::config::DEFAULT_WORKSPACE_ID {
-            self.legacy_default_url.clone()
-        } else {
-            format!("sqlite://{}", self.path_for(id).display())
-        }
+        format!("sqlite://{}", self.path_for(id).display())
     }
 
     /// The on-disk file path for `id`'s SQLite database, for the DuckDB
@@ -153,7 +144,15 @@ pub async fn scope(
     Ok(next.run(request).await)
 }
 
-async fn resolve_role(state: &AppState, workspace_id: Uuid, user_id: Uuid) -> AppResult<Role> {
+/// The caller's role in a workspace, or the no-control-plane `owner`
+/// bypass -- shared with `crate::members`, which enforces its own
+/// admin-or-above gate on top of this membership check for
+/// `/workspaces/{id}/invites|members|transfer-ownership`.
+pub(crate) async fn resolve_role(
+    state: &AppState,
+    workspace_id: Uuid,
+    user_id: Uuid,
+) -> AppResult<Role> {
     match &state.control {
         Some(control) => workspaces::role_for(control, workspace_id, user_id)
             .await?

@@ -1,0 +1,15 @@
+# Local dev overrides. Loaded when APP_ENV is unset or "dev".
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+# Local dev: hybrid. The verifier dispatches per-token by the JWT header
+# `alg`: HS256 -> the shared secret below (./scripts/dev-token, and the
+# integration tests). No network, no identity provider.
+[auth]
+mode = "hybrid"
+jwt_secret = "super-secret-jwt-token-with-at-least-32-characters-long"
+jwks_url = "http://127.0.0.1:54331/auth/v1/.well-known/jwks.json"
+issuer = "http://127.0.0.1:54331/auth/v1"
+audience = "authenticated"

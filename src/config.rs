@@ -1,13 +1,19 @@
-//! Configuration from environment variables (a `.env` file is loaded first if
-//! present). See `.env.example` for every variable.
+//! Configuration. `[server]`/`[database]`/`[auth]` go through the layered
+//! `config` crate loader (`config_loader::load_layered`): `config/default.toml`
+//! -> `config/{APP_ENV}.toml` -> env (`APP__SECTION__KEY`) -> `config/local.toml`
+//! (gitignored). Everything else is still a plain env var (a `.env` file is
+//! loaded first if present) -- see `.env.example` for every variable, and
+//! `docs/architecture.md` for the legacy-env compatibility this module
+//! carries (`AUTH_MODE`, `CONTROL_DATABASE_URL`, `BIND_ADDR`,
+//! `SUPABASE_URL`/`SUPABASE_JWT_AUD`/`SUPABASE_JWT_SECRET`).
 
 use std::fmt;
+use std::net::IpAddr;
 
 use anyhow::{Context, bail};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const DEFAULT_DATABASE_URL: &str = "sqlite://lula.db";
-const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 const DEFAULT_BUCKET_DIR: &str = "data/bucket";
 const DEFAULT_LEAD_MIN_FIT_SCORE: i64 = 50;
@@ -15,27 +21,180 @@ const DEFAULT_CRAWL_MAX_PAGES: u32 = 4;
 const DEFAULT_CRAWL_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_CRAWL_MAX_BYTES: u64 = 1_000_000;
 const DEFAULT_DATA_DIR: &str = "data";
-const DEFAULT_SUPABASE_JWT_AUD: &str = "authenticated";
-const DEFAULT_JWKS_TTL_SECS: u64 = 300;
 const DEFAULT_QUERY_MAX_ROWS: i64 = 1000;
 const DEFAULT_QUERY_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_CHAT_MAX_TOOL_ROUNDS: u32 = 6;
 const DEFAULT_CHAT_MAX_TOKENS: u32 = 1024;
 const DEFAULT_CHAT_MAX_WRITES_PER_TURN: u32 = 5;
-/// Every workspace other than this one lives under
-/// `DATA_DIR/workspaces/{id}.db`; this one is `DATABASE_URL` directly, so a
-/// pre-step-3 single-tenant setup keeps reading the same file. See
+/// `config/dev.toml`'s committed HS256 dev secret. Refused outside
+/// `Env::Dev` the same way Desde0's committed Plaid dev key is -- a
+/// deployment that inherited it by accident must fail loudly, not verify
+/// tokens against a secret anyone can read in this repo.
+const DEV_JWT_SECRET: &str = "super-secret-jwt-token-with-at-least-32-characters-long";
+/// Every workspace (including the legacy single-tenant one, id
+/// [`DEFAULT_WORKSPACE_ID`]) lives under `DATA_DIR/workspaces/{id}.db`; see
 /// `workspace_db::WorkspaceRegistry`.
 pub const DEFAULT_WORKSPACE_ID: Uuid = Uuid::nil();
-/// `AUTH_MODE=dev`'s default user id, shared with `cargo run -- seed`'s
+/// `AuthMode::Dev`'s default user id, shared with `cargo run -- seed`'s
 /// control-plane bootstrap so the dev user it creates (and the workspace it
 /// owns) is exactly the one a locally-running server treats every request
 /// as, with no `X-Dev-User` header needed.
 pub const DEFAULT_DEV_USER_ID: Uuid = Uuid::from_u128(1);
 
+fn default_dev_user_id() -> Uuid {
+    DEFAULT_DEV_USER_ID
+}
+
+/// Which deployment environment this process is running as, decided by
+/// `APP_ENV` (`dev` when unset). Gates the production refusals below
+/// (`Config::validate`): unrecognized is treated as [`Env::Prod`], the
+/// fail-safe direction -- an unrecognized value must never land a dev-mode
+/// or dev-secret bypass in whatever that environment turns out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Env {
+    Dev,
+    Staging,
+    Prod,
+}
+
+impl Env {
+    fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw {
+            "dev" => Ok(Self::Dev),
+            "staging" => Ok(Self::Staging),
+            "prod" => Ok(Self::Prod),
+            other => bail!("unknown APP_ENV `{other}`; expected `dev`, `staging` or `prod`"),
+        }
+    }
+}
+
+/// The subset of config that goes through the layered `config` crate loader
+/// (`config_loader::load_layered`). See plan B1: only these three sections;
+/// everything else in [`Config`] stays a plain env var for now.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Layered {
+    pub server: ServerConfig,
+    pub database: DatabaseConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServerConfig {
+    pub host: IpAddr,
+    pub port: u16,
+    /// Comma-separated CORS allowlist; see [`ServerConfig::cors_origins_list`].
+    #[serde(default)]
+    pub cors_origins: String,
+}
+
+impl ServerConfig {
+    pub fn cors_origins_list(&self) -> Vec<String> {
+        self.cors_origins
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DatabaseConfig {
+    /// The control-plane Postgres URL. Empty disables workspace-membership
+    /// enforcement -- see [`Config::control_database_url`].
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Where the token-signing key material comes from, or `dev` to bypass
+/// verification entirely. `Hs256` is a shared secret (local dev and tests:
+/// no network, no identity provider); `Jwks` fetches public keys from a
+/// JWKS URL (any OIDC provider, Supabase included); `Hybrid` configures
+/// both and dispatches per token by the JWT header `alg`, so a locally
+/// minted HS256 token and a provider-issued ES256 token both validate
+/// against one running server. `Dev` treats every request as
+/// [`AuthConfig::dev_user_id`] (overridable with `X-Dev-User`); refused at
+/// boot outside [`Env::Dev`].
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    Hs256,
+    #[default]
+    Jwks,
+    Hybrid,
+    Dev,
+}
+
+/// The identity provider, expressed entirely as configuration -- no
+/// provider name anywhere in the verifier itself; see `crate::auth::oidc`.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub mode: AuthMode,
+    /// JWKS URL. Required when `mode` is `jwks` or (together with
+    /// `jwt_secret`) `hybrid`.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    /// Shared secret. Required when `mode` is `hs256` or (together with
+    /// `jwks_url`) `hybrid`. Local dev and tests only.
+    #[serde(default)]
+    pub jwt_secret: Option<String>,
+    /// Expected issuer (`iss` claim).
+    #[serde(default)]
+    pub issuer: String,
+    /// Expected audience (`aud` claim).
+    #[serde(default)]
+    pub audience: String,
+    /// `mode = "dev"`'s fixed user id, overridable per-request with
+    /// `X-Dev-User: <uuid>`.
+    #[serde(default = "default_dev_user_id")]
+    pub dev_user_id: Uuid,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthMode::Jwks,
+            jwks_url: None,
+            jwt_secret: None,
+            issuer: String::new(),
+            audience: String::new(),
+            dev_user_id: DEFAULT_DEV_USER_ID,
+        }
+    }
+}
+
+// Hand-written so `jwt_secret` cannot reach a log through a `{config:?}`.
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("mode", &self.mode)
+            .field("jwks_url", &self.jwks_url)
+            .field("jwt_secret", &redacted(self.jwt_secret.as_ref()))
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("dev_user_id", &self.dev_user_id)
+            .finish()
+    }
+}
+
+/// Say whether a secret is set without saying what it is.
+fn redacted(v: Option<&String>) -> &'static str {
+    if v.is_some_and(|s| !s.is_empty()) {
+        "<set>"
+    } else {
+        "<unset>"
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
-    pub database_url: String,
+    pub env: Env,
+    pub server: ServerConfig,
+    pub auth: AuthConfig,
+    /// `{server.host}:{server.port}`, or the legacy `BIND_ADDR` env var
+    /// when set (deprecated; see `Config::from_env`).
     pub bind_addr: String,
     pub extractor: ExtractorConfig,
     /// Local directory raw source files and crawled pages are archived under.
@@ -46,14 +205,16 @@ pub struct Config {
     pub crawl_limits: CrawlLimits,
     /// Default `target_profiles.min_fit_score` when seeding Jack's profile.
     pub lead_min_fit_score: i64,
-    /// Supabase Postgres control plane: profiles, workspaces, membership,
-    /// app definitions, saved queries, schema catalog. `None` disables
-    /// workspace-membership enforcement (every workspace id is accessible
-    /// as `owner`) -- see `workspace_db::scope`.
+    /// The control-plane Postgres URL, resolved from `[database] url`
+    /// (`APP__DATABASE__URL` / the bare `DATABASE_URL` env var, both
+    /// canonical) and the legacy `CONTROL_DATABASE_URL` env var (deprecated,
+    /// wins when set). `None` disables workspace-membership enforcement
+    /// (every workspace id is accessible as `owner`) -- see
+    /// `workspace_db::scope`.
     pub control_database_url: Option<String>,
-    /// Per-workspace SQLite files live under `{data_dir}/workspaces/{id}.db`.
+    /// Per-workspace SQLite files live under `{data_dir}/workspaces/{id}.db`,
+    /// including the legacy default workspace ([`DEFAULT_WORKSPACE_ID`]).
     pub data_dir: String,
-    pub auth: AuthMode,
     /// Hard cap on rows returned by `POST /w/{ws}/queries/{id}/run`.
     pub query_max_rows: i64,
     pub query_timeout_ms: u64,
@@ -103,40 +264,6 @@ impl fmt::Debug for ChatProviderConfig {
                 .field("api_key", &"<redacted>")
                 .field("model", model)
                 .field("base_url", base_url)
-                .finish(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub enum AuthMode {
-    /// `AUTH_MODE=supabase` (the default): verify a Supabase Auth JWT.
-    Supabase {
-        supabase_url: String,
-        aud: String,
-        /// Legacy HS256 fallback; `None` rejects HS256 tokens outright.
-        jwt_secret: Option<String>,
-        jwks_ttl_secs: u64,
-    },
-    /// `AUTH_MODE=dev`: bypass verification. Only reachable by setting the
-    /// env var explicitly, never a fallback.
-    Dev { default_user_id: Uuid },
-}
-
-impl fmt::Debug for AuthMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Supabase {
-                supabase_url, aud, ..
-            } => f
-                .debug_struct("Supabase")
-                .field("supabase_url", supabase_url)
-                .field("aud", aud)
-                .field("jwt_secret", &"<redacted>")
-                .finish(),
-            Self::Dev { default_user_id } => f
-                .debug_struct("Dev")
-                .field("default_user_id", default_user_id)
                 .finish(),
         }
     }
@@ -240,8 +367,9 @@ impl fmt::Debug for ClassifierConfig {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("database_url", &self.database_url)
+            .field("env", &self.env)
             .field("bind_addr", &self.bind_addr)
+            .field("auth", &self.auth)
             .field("extractor", &self.extractor)
             .field("bucket_dir", &self.bucket_dir)
             .field("places", &self.places)
@@ -254,18 +382,22 @@ impl fmt::Debug for Config {
                 &self.control_database_url.as_ref().map(|_| "<set>"),
             )
             .field("data_dir", &self.data_dir)
-            .field("auth", &self.auth)
             .field("query_max_rows", &self.query_max_rows)
             .field("query_timeout_ms", &self.query_timeout_ms)
             .field("chat_provider", &self.chat.provider)
+            .field("cors_origins", &self.server.cors_origins_list())
             .finish()
     }
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let database_url = var("DATABASE_URL").unwrap_or_else(|| DEFAULT_DATABASE_URL.to_owned());
-        let bind_addr = var("BIND_ADDR").unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned());
+        let env = Env::parse(&crate::config_loader::app_env())?;
+        let layered = crate::config_loader::load_layered().context("loading config")?;
+        let (server, auth) = apply_legacy_aliases(layered.server, layered.auth)?;
+        let control_database_url = resolve_control_database_url(layered.database.url);
+        let bind_addr = resolve_bind_addr(&server);
+
         let extractor = match var("EXTRACTOR").as_deref() {
             None | Some("stub") => ExtractorConfig::Stub,
             Some("grok") => ExtractorConfig::Grok {
@@ -304,29 +436,15 @@ impl Config {
             max_bytes: var_parsed("CRAWL_MAX_BYTES", DEFAULT_CRAWL_MAX_BYTES)?,
         };
         let lead_min_fit_score = var_parsed("LEAD_MIN_FIT_SCORE", DEFAULT_LEAD_MIN_FIT_SCORE)?;
-        let control_database_url = var("CONTROL_DATABASE_URL");
         let data_dir = var("DATA_DIR").unwrap_or_else(|| DEFAULT_DATA_DIR.to_owned());
-        let auth = match var("AUTH_MODE").as_deref() {
-            None | Some("supabase") => AuthMode::Supabase {
-                supabase_url: var("SUPABASE_URL")
-                    .context("AUTH_MODE=supabase (the default) requires SUPABASE_URL")?,
-                aud: var("SUPABASE_JWT_AUD").unwrap_or_else(|| DEFAULT_SUPABASE_JWT_AUD.to_owned()),
-                jwt_secret: var("SUPABASE_JWT_SECRET"),
-                jwks_ttl_secs: var_parsed("JWKS_CACHE_TTL_SECS", DEFAULT_JWKS_TTL_SECS)?,
-            },
-            Some("dev") => AuthMode::Dev {
-                default_user_id: var("DEV_USER_ID").map_or_else(
-                    || Ok(DEFAULT_DEV_USER_ID),
-                    |v| v.parse().context("DEV_USER_ID is not a uuid"),
-                )?,
-            },
-            Some(other) => bail!("AUTH_MODE must be `supabase` or `dev`, got `{other}`"),
-        };
         let query_max_rows = var_parsed("QUERY_MAX_ROWS", DEFAULT_QUERY_MAX_ROWS)?;
         let query_timeout_ms = var_parsed("QUERY_TIMEOUT_MS", DEFAULT_QUERY_TIMEOUT_MS)?;
         let chat = chat_config()?;
-        Ok(Self {
-            database_url,
+
+        let config = Self {
+            env,
+            server,
+            auth,
             bind_addr,
             extractor,
             bucket_dir,
@@ -337,12 +455,134 @@ impl Config {
             lead_min_fit_score,
             control_database_url,
             data_dir,
-            auth,
             query_max_rows,
             query_timeout_ms,
             chat,
-        })
+        };
+        config.validate()?;
+        Ok(config)
     }
+
+    /// Refusals that only make sense once every field is loaded: dev mode
+    /// and the committed dev HS256 secret are both refused outside
+    /// `Env::Dev`, so a config that silently inherited either cannot run in
+    /// production -- the same "fail at boot, not at the first request"
+    /// rule `auth::oidc::OidcVerifier::new` already follows for a missing
+    /// key.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.env == Env::Dev {
+            return Ok(());
+        }
+        if self.auth.mode == AuthMode::Dev {
+            bail!("auth.mode = dev is not allowed outside Env::Dev (APP_ENV=dev)");
+        }
+        if matches!(self.auth.mode, AuthMode::Hs256 | AuthMode::Hybrid)
+            && self.auth.jwt_secret.as_deref() == Some(DEV_JWT_SECRET)
+        {
+            bail!(
+                "auth.jwt_secret is config/dev.toml's committed dev secret; refusing to start \
+                 outside Env::Dev (APP_ENV=dev)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Legacy env vars, mapped onto the new config with a startup warning. Kept
+/// separate from `[auth]`'s own fields so the layered loader's precedence
+/// (env overrides file, local.toml overrides env) stays legible; these are
+/// a SECOND pass applied after that loader runs.
+fn apply_legacy_aliases(
+    server: ServerConfig,
+    mut auth: AuthConfig,
+) -> anyhow::Result<(ServerConfig, AuthConfig)> {
+    reject_dropped_supabase_env()?;
+
+    if let Some(mode) = var("AUTH_MODE") {
+        tracing::warn!(
+            legacy = "AUTH_MODE",
+            replacement = "APP__AUTH__MODE",
+            "AUTH_MODE is deprecated; set APP__AUTH__MODE instead"
+        );
+        auth.mode = match mode.as_str() {
+            "dev" => AuthMode::Dev,
+            "supabase" => AuthMode::Jwks,
+            other => bail!("AUTH_MODE must be `dev` or `supabase`, got `{other}`"),
+        };
+    }
+    Ok((server, auth))
+}
+
+/// `SUPABASE_URL`/`SUPABASE_JWT_AUD`/`SUPABASE_JWT_SECRET` are no longer
+/// read. Failing loudly (rather than silently ignoring them) is the point:
+/// a deployment that set one and nothing else would otherwise boot into
+/// `auth.mode = jwks` with an empty issuer, rejecting every token with no
+/// hint why.
+fn reject_dropped_supabase_env() -> anyhow::Result<()> {
+    let checks: &[(&str, &[&str])] = &[
+        (
+            "SUPABASE_URL",
+            &["APP__AUTH__JWKS_URL", "APP__AUTH__ISSUER"],
+        ),
+        ("SUPABASE_JWT_AUD", &["APP__AUTH__AUDIENCE"]),
+        ("SUPABASE_JWT_SECRET", &["APP__AUTH__JWT_SECRET"]),
+    ];
+    for (legacy, replacements) in checks {
+        if var(legacy).is_some() && !replacements.iter().any(|r| var(r).is_some()) {
+            bail!(
+                "{legacy} is no longer read; set {} instead (see .env.example)",
+                replacements.join(" / ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The control-plane Postgres URL: `[database] url` (`APP__DATABASE__URL`,
+/// or the bare `DATABASE_URL` env var when it looks like a Postgres URL --
+/// both canonical, matching what infra's PR #18 injects), overridden by the
+/// legacy `CONTROL_DATABASE_URL` env var when set. A `DATABASE_URL` that
+/// looks like a `sqlite:` path is the OLD meaning (the legacy default
+/// workspace's data file, now `DATA_DIR`-only per plan B1) and is ignored
+/// with a warning rather than misread as a control-plane url.
+fn resolve_control_database_url(layered_url: String) -> Option<String> {
+    let mut url = non_empty(Some(layered_url));
+
+    if let Some(raw) = var("DATABASE_URL") {
+        if raw.starts_with("postgres://") || raw.starts_with("postgresql://") {
+            url = Some(raw);
+        } else {
+            tracing::warn!(
+                "DATABASE_URL is set to a non-postgres url (the old per-workspace sqlite \
+                 path); ignoring it for the control plane, which now reads DATABASE_URL (or \
+                 APP__DATABASE__URL) only as a postgres:// url. The legacy default workspace's \
+                 data now lives under DATA_DIR regardless of this setting."
+            );
+        }
+    }
+    if let Some(legacy) = var("CONTROL_DATABASE_URL") {
+        tracing::warn!(
+            legacy = "CONTROL_DATABASE_URL",
+            replacement = "DATABASE_URL or APP__DATABASE__URL",
+            "CONTROL_DATABASE_URL is deprecated; set DATABASE_URL or APP__DATABASE__URL instead"
+        );
+        url = Some(legacy);
+    }
+    url
+}
+
+fn resolve_bind_addr(server: &ServerConfig) -> String {
+    var("BIND_ADDR").map_or_else(
+        || format!("{}:{}", server.host, server.port),
+        |legacy| {
+            tracing::warn!(
+                legacy = "BIND_ADDR",
+                replacement = "APP__SERVER__HOST / APP__SERVER__PORT",
+                "BIND_ADDR is deprecated; set APP__SERVER__HOST and APP__SERVER__PORT instead"
+            );
+            legacy
+        },
+    )
 }
 
 /// `CHAT_PROVIDER=grok|fake`, defaulting to `fake` unless `XAI_API_KEY` is
@@ -397,6 +637,13 @@ fn var(name: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
+}
+
+/// Present-but-empty is treated as absent, the same rule `var` follows for
+/// env vars -- a `[database] url = ""` default.toml value must read the
+/// same as the key being unset.
+fn non_empty(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
 /// A set environment variable parsed as `T`, or `default` when unset.

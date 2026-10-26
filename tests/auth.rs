@@ -1,10 +1,12 @@
 //! JWT verification (HS256, and ES256/RS256 against a loopback JWKS
-//! server) and the `AUTH_MODE=dev` bypass. No real network: the JWKS
-//! "server" is a plain `TcpListener` on `127.0.0.1:0` serving a canned
-//! response.
+//! server), the `auth.mode = "dev"` bypass, and the `aal2` gate (every
+//! non-public route except `GET /me` -- plan B6). No real network for
+//! JWKS: the "server" is a plain `TcpListener` on `127.0.0.1:0` serving a
+//! canned response.
 
 #![expect(
     clippy::unwrap_used,
+    clippy::indexing_slicing,
     reason = "a failing assertion aborting the test is the mechanism"
 )]
 
@@ -15,7 +17,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::TestApp;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use lula_dog_backend::config::AuthMode;
+use lula_dog_backend::config::{AuthConfig, AuthMode};
 use p256::ecdsa::SigningKey;
 use p256::elliptic_curve::pkcs8::EncodePrivateKey;
 use p256::pkcs8::LineEnding;
@@ -24,6 +26,7 @@ use rsa::traits::PublicKeyParts;
 use serde::Serialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use utoipa::OpenApi as _;
 use uuid::Uuid;
 
 const ISS: &str = "http://127.0.0.1:9/auth/v1";
@@ -36,9 +39,24 @@ struct Claims<'a> {
     aud: &'a str,
     iss: &'a str,
     exp: usize,
+    aal: Option<&'a str>,
 }
 
+/// `aal` defaults to `"aal2"`: every positive-path test in this file
+/// exercises token *validity*, not the assurance-level gate, which has its
+/// own dedicated tests below.
 fn claims(sub: &str, email: &str, iss: &str, aud: &str, exp_in_future: bool) -> String {
+    claims_with_aal(sub, email, iss, aud, exp_in_future, Some("aal2"))
+}
+
+fn claims_with_aal(
+    sub: &str,
+    email: &str,
+    iss: &str,
+    aud: &str,
+    exp_in_future: bool,
+    aal: Option<&str>,
+) -> String {
     let exp = if exp_in_future {
         usize::try_from(chrono::Utc::now().timestamp()).unwrap() + 3600
     } else {
@@ -50,14 +68,19 @@ fn claims(sub: &str, email: &str, iss: &str, aud: &str, exp_in_future: bool) -> 
         aud,
         iss,
         exp,
+        aal,
     })
     .unwrap()
 }
 
 fn sign_hs256(secret: &str, sub: &str, iss: &str, aud: &str) -> String {
+    sign_hs256_with_aal(secret, sub, iss, aud, Some("aal2"))
+}
+
+fn sign_hs256_with_aal(secret: &str, sub: &str, iss: &str, aud: &str, aal: Option<&str>) -> String {
     let header = Header::new(Algorithm::HS256);
     let payload: serde_json::Value =
-        serde_json::from_str(&claims(sub, "u@test.example", iss, aud, true)).unwrap();
+        serde_json::from_str(&claims_with_aal(sub, "u@test.example", iss, aud, true, aal)).unwrap();
     jsonwebtoken::encode(
         &header,
         &payload,
@@ -93,12 +116,25 @@ async fn spawn_http_server(body: String) -> String {
     format!("http://{addr}")
 }
 
-fn auth_mode_for(supabase_url: &str, jwt_secret: Option<&str>) -> AuthMode {
-    AuthMode::Supabase {
-        supabase_url: supabase_url.to_owned(),
-        aud: AUD.to_owned(),
-        jwt_secret: jwt_secret.map(ToOwned::to_owned),
-        jwks_ttl_secs: 300,
+fn hs256_config(secret: Option<&str>) -> AuthConfig {
+    AuthConfig {
+        mode: AuthMode::Hs256,
+        jwt_secret: secret.map(ToOwned::to_owned),
+        issuer: ISS.to_owned(),
+        audience: AUD.to_owned(),
+        ..AuthConfig::default()
+    }
+}
+
+/// `jwks` mode with no HS256 secret: an HS256 token must be rejected
+/// outright. `jwks_url` is set but never dialed by an HS256-only test.
+fn jwks_config(jwks_url: &str, iss: &str) -> AuthConfig {
+    AuthConfig {
+        mode: AuthMode::Jwks,
+        jwks_url: Some(jwks_url.to_owned()),
+        issuer: iss.to_owned(),
+        audience: AUD.to_owned(),
+        ..AuthConfig::default()
     }
 }
 
@@ -137,16 +173,27 @@ async fn dev_mode_rejects_a_malformed_x_dev_user_header() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// `auth.mode = "dev"` is always treated as `aal2`: there is no second
+/// factor to challenge against a bypass that already skips the first.
 #[tokio::test]
-async fn supabase_mode_rejects_missing_authorization_header() {
-    let app = TestApp::with_auth_mode(auth_mode_for("http://127.0.0.1:1", None)).await;
+async fn dev_mode_is_always_aal2() {
+    let app = TestApp::new().await;
+    let (status, body) = app
+        .post("/opportunities", json!({"company": "Dev Co"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn oidc_mode_rejects_missing_authorization_header() {
+    let app = TestApp::with_auth_mode(jwks_config("http://127.0.0.1:1/unused", ISS)).await;
     let (status, body) = app.get("/opportunities").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }
 
 #[tokio::test]
-async fn supabase_mode_rejects_a_non_bearer_header() {
-    let app = TestApp::with_auth_mode(auth_mode_for("http://127.0.0.1:1", Some("secret"))).await;
+async fn oidc_mode_rejects_a_non_bearer_header() {
+    let app = TestApp::with_auth_mode(hs256_config(Some("secret"))).await;
     let (status, body) = app
         .request_with_headers(
             Method::GET,
@@ -161,11 +208,7 @@ async fn supabase_mode_rejects_a_non_bearer_header() {
 #[tokio::test]
 async fn hs256_valid_token_is_accepted() {
     let secret = "test-shared-secret";
-    let app = TestApp::with_auth_mode(auth_mode_for(
-        ISS.trim_end_matches("/auth/v1"),
-        Some(secret),
-    ))
-    .await;
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
     let token = sign_hs256(secret, &Uuid::new_v4().to_string(), ISS, AUD);
     let (status, body) = app
         .request_with_bearer(&token, Method::GET, "/opportunities", None)
@@ -175,11 +218,7 @@ async fn hs256_valid_token_is_accepted() {
 
 #[tokio::test]
 async fn hs256_wrong_secret_is_rejected() {
-    let app = TestApp::with_auth_mode(auth_mode_for(
-        ISS.trim_end_matches("/auth/v1"),
-        Some("right-secret"),
-    ))
-    .await;
+    let app = TestApp::with_auth_mode(hs256_config(Some("right-secret"))).await;
     let token = sign_hs256("wrong-secret", &Uuid::new_v4().to_string(), ISS, AUD);
     let (status, body) = app
         .request_with_bearer(&token, Method::GET, "/opportunities", None)
@@ -190,11 +229,7 @@ async fn hs256_wrong_secret_is_rejected() {
 #[tokio::test]
 async fn hs256_wrong_audience_is_rejected() {
     let secret = "s";
-    let app = TestApp::with_auth_mode(auth_mode_for(
-        ISS.trim_end_matches("/auth/v1"),
-        Some(secret),
-    ))
-    .await;
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
     let token = sign_hs256(secret, &Uuid::new_v4().to_string(), ISS, "some-other-aud");
     let (status, body) = app
         .request_with_bearer(&token, Method::GET, "/opportunities", None)
@@ -205,11 +240,7 @@ async fn hs256_wrong_audience_is_rejected() {
 #[tokio::test]
 async fn hs256_wrong_issuer_is_rejected() {
     let secret = "s";
-    let app = TestApp::with_auth_mode(auth_mode_for(
-        ISS.trim_end_matches("/auth/v1"),
-        Some(secret),
-    ))
-    .await;
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
     let token = sign_hs256(
         secret,
         &Uuid::new_v4().to_string(),
@@ -225,11 +256,7 @@ async fn hs256_wrong_issuer_is_rejected() {
 #[tokio::test]
 async fn hs256_expired_token_is_rejected() {
     let secret = "s";
-    let app = TestApp::with_auth_mode(auth_mode_for(
-        ISS.trim_end_matches("/auth/v1"),
-        Some(secret),
-    ))
-    .await;
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
     let header = Header::new(Algorithm::HS256);
     let payload: serde_json::Value = serde_json::from_str(&claims(
         &Uuid::new_v4().to_string(),
@@ -254,11 +281,7 @@ async fn hs256_expired_token_is_rejected() {
 #[tokio::test]
 async fn hs256_non_uuid_subject_is_rejected() {
     let secret = "s";
-    let app = TestApp::with_auth_mode(auth_mode_for(
-        ISS.trim_end_matches("/auth/v1"),
-        Some(secret),
-    ))
-    .await;
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
     let token = sign_hs256(secret, "not-a-uuid", ISS, AUD);
     let (status, body) = app
         .request_with_bearer(&token, Method::GET, "/opportunities", None)
@@ -269,7 +292,7 @@ async fn hs256_non_uuid_subject_is_rejected() {
 #[tokio::test]
 async fn hs256_without_a_configured_secret_is_rejected() {
     let secret = "s";
-    let app = TestApp::with_auth_mode(auth_mode_for(ISS.trim_end_matches("/auth/v1"), None)).await;
+    let app = TestApp::with_auth_mode(jwks_config("http://127.0.0.1:1/unused", ISS)).await;
     let token = sign_hs256(secret, &Uuid::new_v4().to_string(), ISS, AUD);
     let (status, body) = app
         .request_with_bearer(&token, Method::GET, "/opportunities", None)
@@ -292,11 +315,15 @@ async fn es256_token_verified_against_a_loopback_jwks_server() {
         }]
     });
     let base_url = spawn_http_server(jwks.to_string()).await;
-    let app = TestApp::with_auth_mode(auth_mode_for(&base_url, None)).await;
+    let iss = format!("{base_url}/auth/v1");
+    let app = TestApp::with_auth_mode(jwks_config(
+        &format!("{base_url}/auth/v1/.well-known/jwks.json"),
+        &iss,
+    ))
+    .await;
 
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some("test-es256".to_owned());
-    let iss = format!("{base_url}/auth/v1");
     let payload: serde_json::Value = serde_json::from_str(&claims(
         &Uuid::new_v4().to_string(),
         "u@test.example",
@@ -330,11 +357,15 @@ async fn rs256_token_verified_against_a_loopback_jwks_server() {
         }]
     });
     let base_url = spawn_http_server(jwks.to_string()).await;
-    let app = TestApp::with_auth_mode(auth_mode_for(&base_url, None)).await;
+    let iss = format!("{base_url}/auth/v1");
+    let app = TestApp::with_auth_mode(jwks_config(
+        &format!("{base_url}/auth/v1/.well-known/jwks.json"),
+        &iss,
+    ))
+    .await;
 
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("test-rs256".to_owned());
-    let iss = format!("{base_url}/auth/v1");
     let payload: serde_json::Value = serde_json::from_str(&claims(
         &Uuid::new_v4().to_string(),
         "u@test.example",
@@ -356,13 +387,17 @@ async fn rs256_token_verified_against_a_loopback_jwks_server() {
 async fn jwks_without_the_tokens_kid_is_rejected() {
     let jwks = json!({"keys": []});
     let base_url = spawn_http_server(jwks.to_string()).await;
-    let app = TestApp::with_auth_mode(auth_mode_for(&base_url, None)).await;
+    let iss = format!("{base_url}/auth/v1");
+    let app = TestApp::with_auth_mode(jwks_config(
+        &format!("{base_url}/auth/v1/.well-known/jwks.json"),
+        &iss,
+    ))
+    .await;
 
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some("missing".to_owned());
     let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
     let pkcs8 = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
-    let iss = format!("{base_url}/auth/v1");
     let payload: serde_json::Value = serde_json::from_str(&claims(
         &Uuid::new_v4().to_string(),
         "u@test.example",
@@ -378,4 +413,139 @@ async fn jwks_without_the_tokens_kid_is_rejected() {
         .request_with_bearer(&token, Method::GET, "/opportunities", None)
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+// ── aal2 gate (plan B6) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn aal1_token_is_refused_mfa_required_on_a_workspace_route() {
+    let secret = "s";
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
+    let token = sign_hs256_with_aal(secret, &Uuid::new_v4().to_string(), ISS, AUD, Some("aal1"));
+    let (status, body) = app
+        .request_with_bearer(&token, Method::GET, "/opportunities", None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "mfa_required", "{body}");
+}
+
+#[tokio::test]
+async fn a_token_with_no_aal_claim_at_all_is_refused_mfa_required() {
+    let secret = "s";
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
+    let token = sign_hs256_with_aal(secret, &Uuid::new_v4().to_string(), ISS, AUD, None);
+    let (status, body) = app
+        .request_with_bearer(&token, Method::GET, "/opportunities", None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "mfa_required", "{body}");
+}
+
+#[tokio::test]
+async fn aal2_token_is_accepted_on_a_workspace_route() {
+    let secret = "s";
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
+    let token = sign_hs256_with_aal(secret, &Uuid::new_v4().to_string(), ISS, AUD, Some("aal2"));
+    let (status, body) = app
+        .request_with_bearer(&token, Method::GET, "/opportunities", None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// `GET /me` is the one exemption: an `aal1` token (first sign-in, before
+/// TOTP enrollment) must still be able to reach it so the frontend can
+/// learn it needs to enroll.
+#[tokio::test]
+async fn me_is_reachable_at_aal1() {
+    let secret = "s";
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
+    let token = sign_hs256_with_aal(secret, &Uuid::new_v4().to_string(), ISS, AUD, Some("aal1"));
+    let (status, body) = app
+        .request_with_bearer(&token, Method::GET, "/me", None)
+        .await;
+    // No control plane wired into `with_auth_mode`, so this can't reach
+    // 200 (it 500s on the missing control pool) -- the point here is only
+    // that it is NOT the aal2 gate. `tests/workspaces.rs` covers the full
+    // 200 path with a real control plane.
+    assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// The router-walk test (plan B6): every route the API registers, except
+/// the public ones and `GET /me`, must refuse an `aal1` token with 403
+/// `mfa_required` -- enumerated from the live OpenAPI document (the same
+/// one `GET /openapi.json` serves) so a new route can't be added here
+/// without this test seeing it.
+#[tokio::test]
+async fn every_non_public_non_me_route_requires_aal2() {
+    let secret = "s";
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
+    let token = sign_hs256_with_aal(secret, &Uuid::new_v4().to_string(), ISS, AUD, Some("aal1"));
+
+    let doc = lula_dog_backend::ApiDoc::openapi();
+    assert!(
+        doc.paths.paths.len() > 20,
+        "the gate is not seeing the real route table"
+    );
+
+    let dummy = Uuid::new_v4().to_string();
+    let mut checked = 0;
+    for (path, item) in &doc.paths.paths {
+        let concrete = path
+            .split('/')
+            .map(|seg| {
+                if seg.starts_with('{') && seg.ends_with('}') {
+                    dummy.as_str()
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+
+        for (method, present) in [
+            (Method::GET, item.get.is_some()),
+            (Method::POST, item.post.is_some()),
+            (Method::PUT, item.put.is_some()),
+            (Method::PATCH, item.patch.is_some()),
+            (Method::DELETE, item.delete.is_some()),
+        ] {
+            if !present {
+                continue;
+            }
+            let (status, body) = app
+                .request_with_bearer(&token, method.clone(), &concrete, Some(json!({})))
+                .await;
+
+            if lula_dog_backend::auth::is_public(path) {
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "public route {method} {path} must not be aal2-gated: {body}"
+                );
+                continue;
+            }
+            if method == Method::GET && path == "/me" {
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "GET /me must be exempt from the aal2 gate: {body}"
+                );
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path} should refuse an aal1 token: {body}"
+            );
+            assert_eq!(
+                body["error"]["code"], "mfa_required",
+                "{method} {path} returned 403 for the wrong reason: {body}"
+            );
+        }
+    }
+    assert!(
+        checked > 20,
+        "the gate exercised too few routes ({checked}) to be load-bearing"
+    );
 }

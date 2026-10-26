@@ -13,6 +13,7 @@ pub mod chat;
 pub mod classifier;
 pub mod companies;
 pub mod config;
+pub mod config_loader;
 pub mod control;
 pub mod coverage;
 pub mod crawler;
@@ -61,9 +62,9 @@ use crate::workspace_db::WorkspaceRegistry;
 #[derive(Clone)]
 pub struct AppState {
     pub extractor: Arc<dyn Extractor>,
-    /// The Supabase Postgres control plane. `None` disables workspace
-    /// membership enforcement (every workspace id is accessible as
-    /// `owner`) -- see `workspace_db::scope`.
+    /// The Postgres control plane. `None` disables workspace membership
+    /// enforcement (every workspace id is accessible as `owner`) -- see
+    /// `workspace_db::scope`.
     pub control: Option<ControlPool>,
     pub workspaces: WorkspaceRegistry,
     pub auth: Arc<Auth>,
@@ -76,12 +77,8 @@ pub struct AppState {
     /// doc comment for why a whole turn, not just the LLM call, sits behind
     /// this trait.
     pub build_agent: Arc<dyn BuildAgent>,
-}
-
-impl AsRef<Auth> for AppState {
-    fn as_ref(&self) -> &Auth {
-        &self.auth
-    }
+    /// The CORS allowlist (`[server] cors_origins`, `APP__SERVER__CORS_ORIGINS`).
+    pub cors_origins: Vec<String>,
 }
 
 pub fn extractor_from_config(config: &ExtractorConfig) -> anyhow::Result<Arc<dyn Extractor>> {
@@ -215,6 +212,8 @@ pub fn router(state: AppState) -> Router {
             workspace_db::scope,
         ));
 
+    let cors = cors_layer(&state.cors_origins);
+
     Router::new()
         .route("/health", get(health))
         .route("/openapi.json", get(openapi))
@@ -228,8 +227,37 @@ pub fn router(state: AppState) -> Router {
             get(me::list_workspaces).post(me::create_workspace),
         )
         .nest("/w/{workspace_id}", workspace_routes)
+        .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// The CORS allowlist (plan B9): an allowed origin gets `Access-Control-
+/// Allow-Origin` echoed back and the preflight gets `Access-Control-Max-
+/// Age`; an unlisted origin gets neither. No credentials or cookies --
+/// auth is a bearer token, carried in `Authorization`, which (with
+/// `Content-Type`) is the only header this allows.
+fn cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
+    use axum::http::Method;
+    use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+
+    let origins: Vec<axum::http::HeaderValue> = origins
+        .iter()
+        .filter_map(|o| axum::http::HeaderValue::from_str(o).ok())
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        .max_age(std::time::Duration::from_hours(24))
 }
 
 #[derive(Serialize, ToSchema)]

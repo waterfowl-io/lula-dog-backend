@@ -19,6 +19,17 @@ pub enum AppError {
     Unauthorized(String),
     #[error("{0}")]
     Forbidden(String),
+    /// Below `aal2` on a route that requires it (every non-public route
+    /// except `GET /me`; see `crate::auth`). A distinct code from
+    /// `Forbidden` so the frontend can route straight to the TOTP
+    /// challenge instead of showing a generic access-denied state.
+    #[error("multi-factor authentication required")]
+    MfaRequired,
+    /// The identity provider's JWKS endpoint is unreachable or erroring.
+    /// Distinct from `Unauthorized`: the token may well be valid, so a
+    /// caller should retry rather than re-authenticate.
+    #[error("{0}")]
+    ServiceUnavailable(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     /// A server-side invariant was violated (never caused by the request).
@@ -74,6 +85,15 @@ impl IntoResponse for AppError {
             Self::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.clone()),
             Self::Unauthorized(m) => (StatusCode::UNAUTHORIZED, "unauthorized", m.clone()),
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m.clone()),
+            Self::MfaRequired => (StatusCode::FORBIDDEN, "mfa_required", self.to_string()),
+            Self::ServiceUnavailable(m) => {
+                tracing::warn!(error = %m, "identity provider unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "auth temporarily unavailable".to_owned(),
+                )
+            }
             Self::Database(e) => {
                 tracing::error!(error = %e, "database error");
                 (

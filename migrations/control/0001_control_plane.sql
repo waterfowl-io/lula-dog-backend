@@ -1,50 +1,22 @@
 -- Lula.dog control plane: profiles, workspaces, membership, app definitions,
 -- saved queries, schema catalog, runner configs. Applied to
--- CONTROL_DATABASE_URL (Postgres/Supabase) on startup, separately from the
--- per-workspace SQLite migrations in ../ (the data plane).
+-- DATABASE_URL/CONTROL_DATABASE_URL (Postgres/Supabase) on startup,
+-- separately from the per-workspace SQLite migrations in ../ (the data
+-- plane).
 --
--- `auth.users` and `auth.uid()` are a Supabase convention: real Supabase
--- projects already have them (managed by GoTrue), so this only creates a
--- minimal stand-in when they are missing, e.g. a bare local/CI Postgres. The
--- checks are deliberately "if it doesn't already exist" rather than
--- CREATE OR REPLACE, so a real Supabase project's `auth` schema is never
--- touched.
+-- This never references Supabase's `auth` schema (no `auth.users` stand-in,
+-- no `auth.uid()`, no `auth.users` FK or trigger): the backend connects to
+-- Postgres directly, as a privileged role, and verifies identity itself
+-- (`crate::auth`) rather than through RLS keyed on `auth.uid()`. `profiles.id`
+-- is a plain `uuid` -- the verified JWT's `sub` -- with no foreign key to any
+-- Supabase-managed table, so this migration applies cleanly to a bare
+-- Postgres with no `auth` schema at all.
 
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'auth') THEN
-    CREATE SCHEMA auth;
-  END IF;
-END
-$$;
-
-CREATE TABLE IF NOT EXISTS auth.users (
-  id uuid PRIMARY KEY,
-  email text
-);
-
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_proc p
-    JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname = 'auth' AND p.proname = 'uid'
-  ) THEN
-    CREATE FUNCTION auth.uid() RETURNS uuid AS $fn$
-      SELECT COALESCE(
-        NULLIF(current_setting('request.jwt.claim.sub', true), ''),
-        (NULLIF(current_setting('request.jwt.claims', true), '')::json ->> 'sub')
-      )::uuid
-    $fn$ LANGUAGE sql STABLE;
-  END IF;
-END
-$$;
-
--- One row per Supabase Auth user. The backend upserts this on first sighting
--- of a verified JWT; see the optional trigger below for the Supabase-native
--- alternative (create on auth.users insert).
+-- One row per authenticated user, keyed by their verified JWT `sub`. The
+-- backend upserts this on first sighting of a verified token (see
+-- `crate::auth::provision` / `crate::control::profiles::upsert_from_jwt`).
 CREATE TABLE profiles (
-  id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  id uuid PRIMARY KEY,
   email text NOT NULL,
   display_name text,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -147,76 +119,8 @@ CREATE TABLE runner_configs (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
--- RLS: for tables the frontend might read directly with the Supabase anon/
--- authenticated role. The backend itself connects as a privileged role
--- (table owner), which Postgres always exempts from RLS, so these policies
--- are for direct-from-frontend reads only and change nothing for the
--- backend's own queries.
-ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
-CREATE POLICY profiles_select_self ON profiles
-  FOR SELECT USING (id = auth.uid());
-
-ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
-CREATE POLICY workspaces_select_member ON workspaces
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM workspace_members m
-      WHERE m.workspace_id = workspaces.id AND m.user_id = auth.uid()
-    )
-  );
-
-ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
-CREATE POLICY workspace_members_select_member ON workspace_members
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM workspace_members m
-      WHERE m.workspace_id = workspace_members.workspace_id AND m.user_id = auth.uid()
-    )
-  );
-
-ALTER TABLE app_definitions ENABLE ROW LEVEL SECURITY;
-CREATE POLICY app_definitions_select_member ON app_definitions
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM workspace_members m
-      WHERE m.workspace_id = app_definitions.workspace_id AND m.user_id = auth.uid()
-    )
-  );
-
-ALTER TABLE app_definition_versions ENABLE ROW LEVEL SECURITY;
-CREATE POLICY app_definition_versions_select_member ON app_definition_versions
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM app_definitions d
-      JOIN workspace_members m ON m.workspace_id = d.workspace_id
-      WHERE d.id = app_definition_versions.app_definition_id AND m.user_id = auth.uid()
-    )
-  );
-
-ALTER TABLE saved_queries ENABLE ROW LEVEL SECURITY;
-CREATE POLICY saved_queries_select_member ON saved_queries
-  FOR SELECT USING (
-    EXISTS (
-      SELECT 1 FROM workspace_members m
-      WHERE m.workspace_id = saved_queries.workspace_id AND m.user_id = auth.uid()
-    )
-  );
-
--- Optional: create a profile automatically when Supabase Auth creates a
--- user, mirroring the common Supabase pattern. The backend's own middleware
--- also upserts a profile on first verified request from a user (see
--- `crate::control::profiles::upsert_from_jwt`), so this trigger is a
--- convenience, not a requirement.
-CREATE OR REPLACE FUNCTION public.handle_new_auth_user() RETURNS trigger AS $$
-BEGIN
-  INSERT INTO public.profiles (id, email)
-  VALUES (NEW.id, NEW.email)
-  ON CONFLICT (id) DO NOTHING;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
-DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
-CREATE TRIGGER on_auth_user_created
-  AFTER INSERT ON auth.users
-  FOR EACH ROW EXECUTE FUNCTION public.handle_new_auth_user();
+-- No RLS and no auth.uid()-keyed policies: the backend is the only writer
+-- of this schema, connects as a privileged role, and verifies identity and
+-- workspace membership itself (`crate::auth`, `crate::workspace_db::scope`).
+-- There is no `auth.uid()` session variable to key a policy on, since this
+-- service does not run as Supabase's `authenticated`/`anon` Postgres roles.
