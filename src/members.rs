@@ -86,7 +86,11 @@ pub async fn list_invites(
 }
 
 /// Invite someone by email. An admin may invite `viewer`/`member`/`admin`;
-/// only an owner may invite another `owner`.
+/// only an owner may invite another `owner`. 409s if this email already
+/// belongs to a member of the workspace -- an invite is for someone who
+/// isn't here yet; changing an existing member's role goes through
+/// `PATCH /workspaces/{id}/members/{user_id}` instead, which (unlike
+/// invite acceptance) runs `Role::can_assign` and the last-owner guard.
 #[utoipa::path(
     post,
     path = "/workspaces/{workspace_id}/invites",
@@ -118,7 +122,13 @@ pub async fn create_invite(
             new.role.as_str()
         )));
     }
-    let invite = invites::create(control(&state)?, workspace_id, user.id, email, new.role)
+    let control = control(&state)?;
+    if workspaces::member_with_email_exists(control, workspace_id, email).await? {
+        return Err(AppError::Conflict(
+            "this email already belongs to a member of this workspace".to_owned(),
+        ));
+    }
+    let invite = invites::create(control, workspace_id, user.id, email, new.role)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(db) if db.is_unique_violation() => AppError::Conflict(

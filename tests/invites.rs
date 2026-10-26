@@ -100,6 +100,76 @@ async fn member_and_viewer_cannot_invite_at_all() {
     }
 }
 
+/// Finding 1 (prompt-backend-review.md): an invite is for someone who
+/// isn't a member yet. Inviting an email that already belongs to a
+/// member must 409, not let that email collide with its own membership
+/// later at acceptance time.
+#[tokio::test]
+async fn inviting_an_existing_members_email_is_a_conflict() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let member = Uuid::new_v4();
+    add_member(&app, member, Role::Member).await;
+
+    let (status, body) = app
+        .post(
+            &format!("/workspaces/{}/invites", app.workspace_id),
+            json!({"email": format!("{member}@test.example"), "role": "viewer"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+/// Finding 1 (prompt-backend-review.md): invite acceptance must never
+/// change an existing membership's role -- otherwise an admin could
+/// invite an existing owner's email as `viewer` and silently demote them
+/// (bypassing `Role::can_assign` and the last-owner guard) the next time
+/// that owner's token gets verified, since provisioning runs on every
+/// request. `create_invite` now refuses this at creation time (see
+/// `inviting_an_existing_members_email_is_a_conflict` above), so this
+/// goes around that guard the same way a pre-existing or racing invite
+/// would, straight at `invites::create`, to prove the acceptance path
+/// itself is also safe.
+#[tokio::test]
+async fn accepting_an_invite_never_changes_an_existing_members_role() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let control = app.control.as_ref().unwrap();
+    let owner_email = format!("dev+{}@local.test", app.dev_user_id);
+
+    lula_dog_backend::control::invites::create(
+        control,
+        app.workspace_id,
+        app.dev_user_id,
+        &owner_email,
+        Role::Viewer,
+    )
+    .await
+    .unwrap();
+
+    // Provisioning (and so invite acceptance) runs on every authenticated
+    // request.
+    let (status, _) = app.get("/me").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, members) = app
+        .get(&format!("/workspaces/{}/members", app.workspace_id))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{members}");
+    let member = members
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["user_id"] == app.dev_user_id.to_string())
+        .unwrap();
+    assert_eq!(
+        member["role"], "owner",
+        "invite acceptance must not change an existing member's role: {members}"
+    );
+}
+
 #[tokio::test]
 async fn a_duplicate_pending_invite_is_a_conflict() {
     let Some(app) = TestApp::with_control().await else {

@@ -108,6 +108,21 @@ struct PendingMatch {
 /// accepted. Idempotent (an already-accepted invite is never matched
 /// again) and best-effort from the caller's point of view -- see
 /// `crate::auth::provision`.
+///
+/// Acceptance NEVER changes an existing membership's role: the insert uses
+/// `ON CONFLICT ... DO NOTHING`, not `DO UPDATE`. Without this, an invite
+/// is a role-change that skips `Role::can_assign` and the last-owner guard
+/// entirely -- an admin could invite an existing owner's email as
+/// `viewer` and silently demote them (or promote a viewer) the next time
+/// that owner's token gets verified, since provisioning runs on every
+/// request. `create_invite` (`crate::members`) already refuses to create
+/// an invite for an email that's already a member of the workspace, so
+/// this conflict should only arise from an invite created before that
+/// check existed, or a membership granted after the invite was created; in
+/// either case the already-member row wins and the invite is still marked
+/// accepted below -- its purpose (get this email *some* access) is already
+/// satisfied, and leaving it pending would just re-run this same no-op on
+/// every future request from that email.
 pub async fn accept_pending_for_email(
     pool: &ControlPool,
     user_id: Uuid,
@@ -123,15 +138,23 @@ pub async fn accept_pending_for_email(
 
     for invite in pending {
         let mut tx = pool.begin().await?;
-        sqlx::query(
+        let inserted: Option<(Uuid,)> = sqlx::query_as(
             "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)
-             ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = $3",
+             ON CONFLICT (workspace_id, user_id) DO NOTHING
+             RETURNING workspace_id",
         )
         .bind(invite.workspace_id)
         .bind(user_id)
         .bind(invite.role)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        if inserted.is_none() {
+            tracing::warn!(
+                workspace_id = %invite.workspace_id,
+                invite_id = %invite.id,
+                "invite accepted for an email that is already a member of this workspace; role left unchanged"
+            );
+        }
         // `accepted_at IS NULL` in the WHERE guards against two concurrent
         // requests from the same newly-provisioned user both claiming the
         // same invite; only one UPDATE actually touches a row.

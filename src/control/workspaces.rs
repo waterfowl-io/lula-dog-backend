@@ -211,6 +211,28 @@ pub async fn list_members(pool: &ControlPool, workspace_id: Uuid) -> AppResult<V
     .await?)
 }
 
+/// Whether `email` (matched case-insensitively, the same way invite
+/// acceptance matches it) already belongs to a member of this workspace --
+/// so invite creation can refuse with 409 rather than let acceptance later
+/// collide with an existing membership (see `crate::control::invites`).
+pub async fn member_with_email_exists(
+    pool: &ControlPool,
+    workspace_id: Uuid,
+    email: &str,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM workspace_members m
+            JOIN profiles p ON p.id = m.user_id
+            WHERE m.workspace_id = $1 AND lower(p.email) = lower($2)
+        )",
+    )
+    .bind(workspace_id)
+    .bind(email)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// How many OTHER owners this workspace has, for the last-owner guard: a
 /// change to `exclude_user`'s own membership (demote, remove, or a
 /// transfer's demotion of the outgoing owner) is safe only if at least one
