@@ -239,6 +239,12 @@ pub async fn member_with_email_exists(
 /// change to `exclude_user`'s own membership (demote, remove, or a
 /// transfer's demotion of the outgoing owner) is safe only if at least one
 /// owner remains once this user's current role no longer counts.
+///
+/// Reads outside any lock -- fine for display/advisory use, but NOT the
+/// last-owner guard itself (see `locked_owner_count_excluding`): calling
+/// this, then separately writing the role change, is exactly the
+/// check-then-act gap that let two concurrent demotions each observe "the
+/// other owner" and both proceed, leaving zero.
 pub async fn owner_count_excluding(
     pool: &ControlPool,
     workspace_id: Uuid,
@@ -254,8 +260,13 @@ pub async fn owner_count_excluding(
     .await?)
 }
 
-/// Insert or update a member's role. Idempotent; used both by invite
-/// acceptance and by `PATCH /workspaces/{id}/members/{user_id}`.
+/// Insert or update a member's role with no authorization or last-owner
+/// check at all -- idempotent, for invite acceptance (which only ever
+/// grants a NEW member a role, never demotes an existing one; see
+/// `crate::control::invites`) and test fixtures. `PATCH
+/// /workspaces/{id}/members/{user_id}` must go through [`change_role`]
+/// instead, which runs `Role::can_assign` and the last-owner guard
+/// atomically.
 pub async fn set_role(
     pool: &ControlPool,
     workspace_id: Uuid,
@@ -274,18 +285,142 @@ pub async fn set_role(
     Ok(())
 }
 
-pub async fn remove_member(pool: &ControlPool, workspace_id: Uuid, user_id: Uuid) -> AppResult<()> {
-    sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
+/// Lock every member row of `workspace_id` for the rest of `tx`
+/// (`SELECT ... FOR UPDATE`): the last-owner guard is a count-then-act
+/// check, so without a lock two concurrent calls on the same workspace
+/// (two demotions, a demotion racing a removal, a removal racing a
+/// transfer, ...) could each read "another owner remains" before either
+/// writes, and both proceed. A second transaction's `lock_members` call
+/// blocks here until the first commits or rolls back, then its own reads
+/// see the up-to-date membership. A workspace's membership is small
+/// (people, not rows-at-scale), so locking all of it is cheap and simplest
+/// to reason about -- no per-row lock ordering to get wrong.
+async fn lock_members(tx: &mut sqlx::PgConnection, workspace_id: Uuid) -> AppResult<()> {
+    sqlx::query("SELECT 1 FROM workspace_members WHERE workspace_id = $1 FOR UPDATE")
         .bind(workspace_id)
-        .bind(user_id)
-        .execute(pool)
+        .fetch_all(tx)
         .await?;
     Ok(())
 }
 
+/// `role_for`, but reading through `tx` so it sees `lock_members`'
+/// consistent, locked snapshot rather than a fresh unlocked read.
+async fn locked_role_for(
+    tx: &mut sqlx::PgConnection,
+    workspace_id: Uuid,
+    user_id: Uuid,
+) -> AppResult<Option<Role>> {
+    Ok(sqlx::query_scalar::<_, Role>(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_optional(tx)
+    .await?)
+}
+
+/// `owner_count_excluding`, but reading through `tx` (see `locked_role_for`).
+async fn locked_owner_count_excluding(
+    tx: &mut sqlx::PgConnection,
+    workspace_id: Uuid,
+    exclude_user: Uuid,
+) -> AppResult<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_members
+         WHERE workspace_id = $1 AND role = 'owner' AND user_id <> $2",
+    )
+    .bind(workspace_id)
+    .bind(exclude_user)
+    .fetch_one(tx)
+    .await?)
+}
+
+const NO_OWNER_LEFT: &str = "the workspace must keep at least one owner";
+
+/// Atomically authorize and apply a role change for an existing member:
+/// `Role::can_assign` and the last-owner guard both run inside the same
+/// locked transaction as the write (see `lock_members`), so this can't
+/// race another call changing/removing a member of the same workspace.
+/// 404 if `user_id` isn't a member; 403 if `actor_role` isn't allowed to
+/// make this particular change; 409 if it would leave no owner.
+pub async fn change_role(
+    pool: &ControlPool,
+    workspace_id: Uuid,
+    actor_role: Role,
+    user_id: Uuid,
+    new_role: Role,
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    lock_members(&mut tx, workspace_id).await?;
+    let current = locked_role_for(&mut tx, workspace_id, user_id)
+        .await?
+        .ok_or(AppError::NotFound("member"))?;
+    if !Role::can_assign(actor_role, Some(current), Some(new_role)) {
+        return Err(AppError::Forbidden(format!(
+            "the {} role cannot change a {} member to {}",
+            actor_role.as_str(),
+            current.as_str(),
+            new_role.as_str()
+        )));
+    }
+    if current == Role::Owner
+        && new_role != Role::Owner
+        && locked_owner_count_excluding(&mut tx, workspace_id, user_id).await? == 0
+    {
+        return Err(AppError::Conflict(NO_OWNER_LEFT.to_owned()));
+    }
+    sqlx::query("UPDATE workspace_members SET role = $3 WHERE workspace_id = $1 AND user_id = $2")
+        .bind(workspace_id)
+        .bind(user_id)
+        .bind(new_role)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Atomically authorize and apply removing an existing member -- same
+/// shape and same lock as [`change_role`]. 404 if `user_id` isn't a
+/// member; 403 if `actor_role` isn't allowed to remove them; 409 if it
+/// would leave no owner.
+pub async fn remove_member(
+    pool: &ControlPool,
+    workspace_id: Uuid,
+    actor_role: Role,
+    user_id: Uuid,
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    lock_members(&mut tx, workspace_id).await?;
+    let current = locked_role_for(&mut tx, workspace_id, user_id)
+        .await?
+        .ok_or(AppError::NotFound("member"))?;
+    if !Role::can_assign(actor_role, Some(current), None) {
+        return Err(AppError::Forbidden(format!(
+            "the {} role cannot remove a {} member",
+            actor_role.as_str(),
+            current.as_str()
+        )));
+    }
+    if current == Role::Owner
+        && locked_owner_count_excluding(&mut tx, workspace_id, user_id).await? == 0
+    {
+        return Err(AppError::Conflict(NO_OWNER_LEFT.to_owned()));
+    }
+    sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
+        .bind(workspace_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Move ownership from `from_user` to `to_user` (already a member) in one
-/// transaction, so the workspace is never observed without an owner
-/// between the two writes.
+/// locked transaction (see `lock_members`), so the workspace is never
+/// observed without an owner between the two writes, and so a concurrent
+/// change to either user's membership on the same workspace can't run
+/// between this transaction's reads and its writes. 403 if `from_user` is
+/// not (still, as of the lock) an owner; 404 if `to_user` is not a member.
 pub async fn transfer_ownership(
     pool: &ControlPool,
     workspace_id: Uuid,
@@ -293,6 +428,18 @@ pub async fn transfer_ownership(
     to_user: Uuid,
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
+    lock_members(&mut tx, workspace_id).await?;
+    let from_role = locked_role_for(&mut tx, workspace_id, from_user)
+        .await?
+        .ok_or(AppError::NotFound("member"))?;
+    if from_role != Role::Owner {
+        return Err(AppError::Forbidden(
+            "transferring ownership requires the owner role".to_owned(),
+        ));
+    }
+    locked_role_for(&mut tx, workspace_id, to_user)
+        .await?
+        .ok_or(AppError::NotFound("member"))?;
     sqlx::query(
         "UPDATE workspace_members SET role = 'admin' WHERE workspace_id = $1 AND user_id = $2",
     )

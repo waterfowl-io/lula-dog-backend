@@ -365,6 +365,74 @@ async fn demoting_an_owner_is_fine_when_another_owner_remains() {
     assert_eq!(body["role"], "admin");
 }
 
+/// Finding 7 (prompt-backend-delete.md): the last-owner guard used to be a
+/// separate `SELECT COUNT(...)` followed by a separate `UPDATE`, with no
+/// lock between them -- two concurrent demotions of the workspace's two
+/// owners could each see "the other owner" still in the count and both
+/// proceed, leaving zero. `Role::change_role` now locks the workspace's
+/// member rows (`SELECT ... FOR UPDATE`) for the whole check-then-act
+/// transaction, so the second call blocks until the first commits and then
+/// re-checks against the up-to-date membership. Each owner self-demotes
+/// (actor == target), so the race is purely the last-owner count, not
+/// either caller's own authority changing underneath them -- fire both at
+/// once: exactly one must succeed and the other must 409, never both.
+#[tokio::test]
+async fn concurrent_demotions_of_both_owners_cannot_leave_the_workspace_ownerless() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let owner_a = app.dev_user_id;
+    let owner_b = Uuid::new_v4();
+    add_member(&app, owner_b, Role::Owner).await;
+
+    let path_a = format!("/workspaces/{}/members/{owner_a}", app.workspace_id);
+    let path_b = format!("/workspaces/{}/members/{owner_b}", app.workspace_id);
+    let (a_result, b_result) = tokio::join!(
+        app.request_as(
+            owner_a,
+            Method::PATCH,
+            &path_a,
+            Some(json!({"role": "admin"}))
+        ),
+        app.request_as(
+            owner_b,
+            Method::PATCH,
+            &path_b,
+            Some(json!({"role": "admin"}))
+        ),
+    );
+
+    let statuses = [a_result.0, b_result.0];
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "exactly one demotion should succeed: {statuses:?} ({a_result:?}, {b_result:?})"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CONFLICT)
+            .count(),
+        1,
+        "exactly one demotion should be refused as the last-owner guard: {statuses:?}"
+    );
+
+    let (status, members) = app
+        .get(&format!("/workspaces/{}/members", app.workspace_id))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{members}");
+    let owners = members
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "owner")
+        .count();
+    assert_eq!(
+        owners, 1,
+        "the workspace must have exactly one owner left: {members}"
+    );
+}
+
 #[tokio::test]
 async fn transfer_ownership_moves_owner_and_demotes_the_caller() {
     let Some(app) = TestApp::with_control().await else {

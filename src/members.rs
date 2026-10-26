@@ -230,26 +230,7 @@ pub async fn update_member_role(
 ) -> AppResult<Json<Member>> {
     let actor_role = require_admin(&state, workspace_id, user.id).await?;
     let control = control(&state)?;
-    let current = workspaces::role_for(control, workspace_id, user_id)
-        .await?
-        .ok_or(AppError::NotFound("member"))?;
-    if !Role::can_assign(actor_role, Some(current), Some(req.role)) {
-        return Err(AppError::Forbidden(format!(
-            "the {} role cannot change a {} member to {}",
-            actor_role.as_str(),
-            current.as_str(),
-            req.role.as_str()
-        )));
-    }
-    if current == Role::Owner
-        && req.role != Role::Owner
-        && workspaces::owner_count_excluding(control, workspace_id, user_id).await? == 0
-    {
-        return Err(AppError::Conflict(
-            "the workspace must keep at least one owner".to_owned(),
-        ));
-    }
-    workspaces::set_role(control, workspace_id, user_id, req.role).await?;
+    workspaces::change_role(control, workspace_id, actor_role, user_id, req.role).await?;
     Ok(Json(
         workspaces::list_members(control, workspace_id)
             .await?
@@ -283,24 +264,7 @@ pub async fn remove_member(
 ) -> AppResult<StatusCode> {
     let actor_role = require_admin(&state, workspace_id, user.id).await?;
     let control = control(&state)?;
-    let current = workspaces::role_for(control, workspace_id, user_id)
-        .await?
-        .ok_or(AppError::NotFound("member"))?;
-    if !Role::can_assign(actor_role, Some(current), None) {
-        return Err(AppError::Forbidden(format!(
-            "the {} role cannot remove a {} member",
-            actor_role.as_str(),
-            current.as_str()
-        )));
-    }
-    if current == Role::Owner
-        && workspaces::owner_count_excluding(control, workspace_id, user_id).await? == 0
-    {
-        return Err(AppError::Conflict(
-            "the workspace must keep at least one owner".to_owned(),
-        ));
-    }
-    workspaces::remove_member(control, workspace_id, user_id).await?;
+    workspaces::remove_member(control, workspace_id, actor_role, user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -345,9 +309,6 @@ pub async fn transfer_ownership(
         ));
     }
     let control = control(&state)?;
-    workspaces::role_for(control, workspace_id, req.to_user_id)
-        .await?
-        .ok_or(AppError::NotFound("member"))?;
     workspaces::transfer_ownership(control, workspace_id, user.id, req.to_user_id).await?;
     Ok(Json(
         workspaces::list_members(control, workspace_id)

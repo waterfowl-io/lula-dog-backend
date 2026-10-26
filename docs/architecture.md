@@ -200,9 +200,16 @@ IS granting `owner` to someone else):
 - Below `admin`, nothing is assignable; `viewer`/`member` can't even invite.
 
 A change is additionally refused with 409 if it would leave the workspace
-with no owner at all (`workspaces::owner_count_excluding`) -- checked
-before any demotion or removal, never assumed safe just because the role
-pair passed `can_assign`.
+with no owner at all, never assumed safe just because the role pair passed
+`can_assign`. `change_role`/`remove_member`/`transfer_ownership`
+(`src/control/workspaces.rs`) each run this check in the SAME transaction
+as the write, after `SELECT ... FOR UPDATE`-locking the workspace's member
+rows: a naive separate "count owners, then write" let two concurrent
+demotions of a workspace's two owners each see "the other owner" still in
+the count and both proceed, leaving zero. The lock makes the second call
+block until the first commits, so it re-checks against the up-to-date
+membership instead. `workspaces::owner_count_excluding` (no lock) still
+exists for display/advisory reads that aren't making a change.
 
 **Creating the auth user is phase 1, following Desde0**: the operator
 clicks "Invite user" in the Supabase dashboard. This service's own
