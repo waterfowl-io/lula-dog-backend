@@ -12,7 +12,8 @@
 
 mod common;
 
-use axum::http::{Method, StatusCode};
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::TestApp;
@@ -25,7 +26,9 @@ use rsa::RsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 use serde::Serialize;
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower::ServiceExt;
 use utoipa::OpenApi as _;
 use uuid::Uuid;
 
@@ -92,15 +95,27 @@ fn sign_hs256_with_aal(secret: &str, sub: &str, iss: &str, aud: &str, aal: Optio
 /// Serves `body` for every connection it accepts, once. Returns the base
 /// URL (`http://127.0.0.1:PORT`).
 async fn spawn_http_server(body: String) -> String {
+    let (base_url, _hits) = spawn_counting_http_server(body).await;
+    base_url
+}
+
+/// Like [`spawn_http_server`], but also returns a counter of how many
+/// connections it has accepted -- so a test can assert a refetch did (or,
+/// for the cooldown test below, did NOT) happen.
+async fn spawn_counting_http_server(body: String) -> (String, std::sync::Arc<AtomicUsize>) {
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let hits_clone = hits.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
             let body = body.clone();
+            let hits = hits_clone.clone();
             tokio::spawn(async move {
+                hits.fetch_add(1, Ordering::SeqCst);
                 let mut buf = [0_u8; 4096];
                 let _ = socket.read(&mut buf).await;
                 let response = format!(
@@ -113,7 +128,7 @@ async fn spawn_http_server(body: String) -> String {
             });
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), hits)
 }
 
 fn hs256_config(secret: Option<&str>) -> AuthConfig {
@@ -415,6 +430,82 @@ async fn jwks_without_the_tokens_kid_is_rejected() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }
 
+/// Finding 3 (prompt-backend-review.md): without a cooldown, every token
+/// bearing a `kid` this service hasn't cached makes it refetch the whole
+/// JWKS document -- so anyone sending garbage `kid`s can make the API
+/// hammer the identity provider. A second unknown `kid` arriving right
+/// after the first must not trigger a second network call.
+#[tokio::test]
+async fn unknown_kid_refetch_is_rate_limited() {
+    let jwks = json!({"keys": []});
+    let (base_url, hits) = spawn_counting_http_server(jwks.to_string()).await;
+    let iss = format!("{base_url}/auth/v1");
+    let app = TestApp::with_auth_mode(jwks_config(
+        &format!("{base_url}/auth/v1/.well-known/jwks.json"),
+        &iss,
+    ))
+    .await;
+
+    let mint = |kid: &str| {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(kid.to_owned());
+        let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
+        let pkcs8 = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&claims(
+            &Uuid::new_v4().to_string(),
+            "u@test.example",
+            &iss,
+            AUD,
+            true,
+        ))
+        .unwrap();
+        let key = EncodingKey::from_ec_pem(pkcs8.as_bytes()).unwrap();
+        jsonwebtoken::encode(&header, &payload, &key).unwrap()
+    };
+
+    let (status, body) = app
+        .request_with_bearer(&mint("first-unknown"), Method::GET, "/opportunities", None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let (status, body) = app
+        .request_with_bearer(&mint("second-unknown"), Method::GET, "/opportunities", None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a second unknown kid within the cooldown window must not refetch the JWKS"
+    );
+}
+
+// ── 401 bodies stay coarse (review finding 2) ───────────────────
+
+/// `AppError::Unauthorized`'s detail (validation-failure internals like
+/// `ExpiredSignature` or `missing kid`) must never reach the client -- it
+/// is an oracle for a token forger. Ported from Desde0's coarse
+/// `AuthError` bodies (`/workspace/lula-auth/ref/desde0-backend/src/auth/
+/// mod.rs`).
+#[tokio::test]
+async fn a_rejected_token_gets_a_coarse_body_not_the_validation_detail() {
+    let app = TestApp::with_auth_mode(hs256_config(Some("right-secret"))).await;
+    let token = sign_hs256("wrong-secret", &Uuid::new_v4().to_string(), ISS, AUD);
+    let (status, body) = app
+        .request_with_bearer(&token, Method::GET, "/opportunities", None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["message"], "invalid token", "{body}");
+}
+
+#[tokio::test]
+async fn a_missing_token_gets_its_own_coarse_message() {
+    let app = TestApp::with_auth_mode(jwks_config("http://127.0.0.1:1/unused", ISS)).await;
+    let (status, body) = app.get("/opportunities").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["message"], "missing token", "{body}");
+}
+
 // ── aal2 gate (plan B6) ──────────────────────────────────────────
 
 #[tokio::test]
@@ -468,6 +559,43 @@ async fn me_is_reachable_at_aal1() {
     // that it is NOT the aal2 gate. `tests/workspaces.rs` covers the full
     // 200 path with a real control plane.
     assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// Finding 4 (prompt-backend-review.md): the `/me` exemption keys off an
+/// exact `parts.uri.path() == "/me"` && `GET` match. Confirm path tricks
+/// that might coerce a request onto that exemption -- a trailing slash, a
+/// doubled leading slash, percent-encoding the route, or swapping the
+/// method -- never let an `aal1` token reach anything beyond what the
+/// real `GET /me` already allows at `aal1`: either the request doesn't
+/// route at all (404/405), or it does and the `aal2` gate still applies.
+/// Built against `app.router` directly (not `TestApp::request*`, which
+/// prefixes bare paths with `/w/{workspace_id}`) so the URI on the wire is
+/// exactly the string under test.
+#[tokio::test]
+async fn me_exemption_is_not_fooled_by_path_tricks() {
+    let secret = "s";
+    let app = TestApp::with_auth_mode(hs256_config(Some(secret))).await;
+    let token = sign_hs256_with_aal(secret, &Uuid::new_v4().to_string(), ISS, AUD, Some("aal1"));
+
+    for (method, path) in [
+        (Method::GET, "/me/"),
+        (Method::GET, "//me"),
+        (Method::GET, "/%6De"),
+        (Method::HEAD, "/me"),
+    ] {
+        let request = Request::builder()
+            .method(method.clone())
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.router.clone().oneshot(request).await.unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "{method} {path} must not bypass the aal2 gate via the /me exemption"
+        );
+    }
 }
 
 /// The router-walk test (plan B6): every route the API registers, except

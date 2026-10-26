@@ -20,12 +20,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 use crate::auth::{Claims, TokenVerifier};
@@ -39,10 +39,22 @@ enum JwksKey {
     Ec { x: String, y: String },
 }
 
-/// The JWKS half: public keys fetched and cached by `kid`.
+/// How long an unknown `kid` must wait before it can trigger another JWKS
+/// refetch. Desde0 has no such cooldown (checked
+/// `/workspace/lula-auth/ref/desde0-backend/src/auth/oidc.rs`); this is a
+/// deliberate addition, not a port: without it, anyone sending tokens with
+/// garbage `kid`s makes this service hammer the provider's JWKS endpoint
+/// once per request.
+const JWKS_REFETCH_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// The JWKS half: public keys fetched and cached by `kid`. `fetch_gate`
+/// double-duties as a singleflight lock (only the task holding it actually
+/// calls the network; everyone else queues behind it and then rechecks the
+/// cache) and the refetch cooldown clock.
 struct Jwks {
     url: String,
     cache: Arc<RwLock<HashMap<String, JwksKey>>>,
+    fetch_gate: Mutex<Option<Instant>>,
     client: reqwest::Client,
 }
 
@@ -77,6 +89,7 @@ impl OidcVerifier {
             Ok(Some(Jwks {
                 url: jwks_url,
                 cache: Arc::new(RwLock::new(HashMap::new())),
+                fetch_gate: Mutex::new(None),
                 client,
             }))
         };
@@ -196,6 +209,28 @@ impl Jwks {
         if let Some(k) = cached {
             return Ok(k);
         }
+
+        // Singleflight: only the task that acquires this lock dials the
+        // network; every other task queued behind it (whether it is
+        // waiting on the same unknown `kid` or a different one) rechecks
+        // the cache first, since the fetch it waited for may have already
+        // resolved it.
+        let mut gate = self.fetch_gate.lock().await;
+        let cached = self.cache.read().await.get(kid).cloned();
+        if let Some(k) = cached {
+            return Ok(k);
+        }
+        if let Some(last) = *gate
+            && last.elapsed() < JWKS_REFETCH_COOLDOWN
+        {
+            return Err(AppError::Unauthorized(format!(
+                "invalid token: kid not found: {kid} (JWKS refetch on cooldown)"
+            )));
+        }
+        // Recorded before the call resolves, successful or not: a
+        // malformed/garbage `kid` must not be able to force a refetch on
+        // every request regardless of whether the endpoint is up.
+        *gate = Some(Instant::now());
         let fetched = fetch_jwks(&self.client, &self.url).await?;
         let mut w = self.cache.write().await;
         w.extend(fetched);

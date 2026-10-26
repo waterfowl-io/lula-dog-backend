@@ -15,6 +15,19 @@ pub enum AppError {
     NotFound(&'static str),
     #[error("{0}")]
     Conflict(String),
+    /// No bearer token presented at all (no `Authorization` header). A
+    /// fixed message, not a `String`: there is no detail to carry, so
+    /// nothing to accidentally leak.
+    #[error("missing bearer token")]
+    MissingToken,
+    /// A bearer token was presented but rejected -- bad signature, wrong
+    /// issuer/audience, expired, malformed, unsupported alg, unknown `kid`,
+    /// missing `sub`/`email` claim, and so on. `m` is the precise reason,
+    /// which is an oracle for a token forger if it reaches the client: it
+    /// is logged instead (see `IntoResponse`), never returned. The client
+    /// always gets the same coarse "invalid token", ported from Desde0's
+    /// `AuthError::InvalidToken` (`/workspace/lula-auth/ref/desde0-backend/
+    /// src/auth/mod.rs`).
     #[error("{0}")]
     Unauthorized(String),
     #[error("{0}")]
@@ -83,7 +96,19 @@ impl IntoResponse for AppError {
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m.clone()),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found", self.to_string()),
             Self::Conflict(m) => (StatusCode::CONFLICT, "conflict", m.clone()),
-            Self::Unauthorized(m) => (StatusCode::UNAUTHORIZED, "unauthorized", m.clone()),
+            Self::MissingToken => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing token".to_owned(),
+            ),
+            Self::Unauthorized(m) => {
+                tracing::warn!(error = %m, "bearer token rejected");
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "invalid token".to_owned(),
+                )
+            }
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, "forbidden", m.clone()),
             Self::MfaRequired => (StatusCode::FORBIDDEN, "mfa_required", self.to_string()),
             Self::ServiceUnavailable(m) => {

@@ -180,9 +180,10 @@ impl Auth {
                 })
             }
             Self::Oidc(verifier) => {
-                let header = parts.headers.get(AUTHORIZATION).ok_or_else(|| {
-                    AppError::Unauthorized("missing Authorization header".to_owned())
-                })?;
+                let header = parts
+                    .headers
+                    .get(AUTHORIZATION)
+                    .ok_or(AppError::MissingToken)?;
                 let value = header.to_str().map_err(|_| {
                     AppError::Unauthorized("Authorization header is not valid UTF-8".to_owned())
                 })?;
