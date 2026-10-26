@@ -85,11 +85,12 @@ pub struct ChatRequest {
 /// `draft_created` (build mode), a final `final` event with usage, and
 /// `error`.
 ///
-/// Build mode requires the admin or owner role (403 otherwise, see
-/// `crate::control::workspaces::Role`); data mode is open to every member
-/// `WorkspaceContext` already let through (a viewer can read but
-/// `crate::actions::dispatch` rejects their writes the same as the HTTP
-/// endpoints would).
+/// Build mode requires the `member` role or above (403 otherwise, via the
+/// same `Role::require` every other gate in the codebase uses -- see
+/// `crate::control::workspaces::Role`); data mode needs nothing beyond
+/// what `WorkspaceContext` already enforces, since `workspace_db::scope`
+/// refuses a `viewer` this whole route (any method but GET/HEAD/OPTIONS)
+/// before either mode's handler runs.
 #[utoipa::path(
     post,
     path = "/w/{workspace_id}/apps/{app}/chat",
@@ -113,10 +114,8 @@ pub async fn stream_chat(
     ApiPath(AppParam { app }): ApiPath<AppParam>,
     ApiJson(req): ApiJson<ChatRequest>,
 ) -> AppResult<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static>> {
-    if req.mode == Mode::Build && ws.role < Role::Admin {
-        return Err(AppError::Forbidden(
-            "build mode requires the admin or owner role".to_owned(),
-        ));
+    if req.mode == Mode::Build {
+        ws.role.require(Role::Member)?;
     }
 
     let app = resolve_app(&state, &ws, &app).await?;

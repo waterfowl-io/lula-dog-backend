@@ -10,9 +10,22 @@ use uuid::Uuid;
 use super::ControlPool;
 use crate::error::{AppError, AppResult};
 
-/// `owner` and `admin` manage membership and settings; `member` and
-/// `viewer` cannot. `viewer` cannot write workspace data; the other three
-/// can. Ordered least to most privileged.
+/// Ordered least to most privileged. The matrix (Nolan, 2026-10-25,
+/// superseding the plan's original one):
+///
+/// - `viewer`: read-only. No data writes, no chat (data or build mode), no
+///   publish/discard/rollback.
+/// - `member`: `viewer` + write workspace data, build-mode chat, publish,
+///   discard and roll back app versions.
+/// - `admin`: `member` + share/unshare (invite, remove and change the role
+///   of `viewer`/`member`/`admin` members -- see `can_assign`) + delete any
+///   workspace-level resource or member (invites, members; see
+///   `crate::members` and `docs/architecture.md`'s DELETE-route table).
+/// - `owner`: `admin` + the only role that may grant or remove `owner` or
+///   call `transfer-ownership` (`can_assign`). A workspace always keeps at
+///   least one owner (`owner_count_excluding`). Deleting the whole
+///   workspace, if that capability existed, would stay owner-only; no such
+///   endpoint exists yet.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, sqlx::Type, ToSchema,
 )]
@@ -26,10 +39,6 @@ pub enum Role {
 }
 
 impl Role {
-    pub const fn can_write(self) -> bool {
-        !matches!(self, Self::Viewer)
-    }
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Owner => "owner",
@@ -37,6 +46,42 @@ impl Role {
             Self::Member => "member",
             Self::Viewer => "viewer",
         }
+    }
+
+    /// The one minimum-role check every gate in the codebase goes through --
+    /// `workspace_db::scope` (workspace data writes, build-mode chat and
+    /// publish/discard/rollback, all `member`+), `members::require_admin`
+    /// (`admin`+) and the chat build-mode gate alike -- so none of them can
+    /// quietly compare roles differently from the others.
+    pub fn require(self, min: Self) -> AppResult<()> {
+        if self < min {
+            return Err(AppError::Forbidden(format!(
+                "the {} role or above is required",
+                min.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Can `actor` make this role change? `from`/`to` are `None` for "no
+    /// membership yet" (an invite) and "membership removed" respectively,
+    /// so one function covers inviting, role changes and removal alike.
+    ///
+    /// `admin` may invite, promote, demote or remove `viewer`/`member`/
+    /// `admin` -- the "share/unshare" half of the matrix above. Only
+    /// `owner` may grant or remove `owner`, which also covers
+    /// `transfer-ownership`, since transferring is granting `owner` to
+    /// someone else. Below `admin`, nothing is assignable. This says
+    /// nothing about whether the change would leave the workspace with no
+    /// owner at all; that needs a membership count the caller has, not a
+    /// pair of roles -- see `owner_count_excluding`.
+    #[must_use]
+    pub fn can_assign(actor: Self, from: Option<Self>, to: Option<Self>) -> bool {
+        if actor < Self::Admin {
+            return false;
+        }
+        let touches_owner = from == Some(Self::Owner) || to == Some(Self::Owner);
+        !touches_owner || actor == Self::Owner
     }
 }
 
@@ -139,4 +184,105 @@ pub async fn find_by_name(pool: &ControlPool, name: &str) -> AppResult<Option<Wo
             .fetch_optional(pool)
             .await?,
     )
+}
+
+/// A member row, with the profile fields the members UI needs -- see
+/// `GET /workspaces/{id}/members`.
+#[derive(Debug, Clone, Serialize, FromRow, ToSchema)]
+pub struct Member {
+    pub user_id: Uuid,
+    pub email: String,
+    pub display_name: Option<String>,
+    pub role: Role,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Every member of a workspace, oldest first.
+pub async fn list_members(pool: &ControlPool, workspace_id: Uuid) -> AppResult<Vec<Member>> {
+    Ok(sqlx::query_as(
+        "SELECT m.user_id, p.email, p.display_name, m.role, m.created_at
+         FROM workspace_members m
+         JOIN profiles p ON p.id = m.user_id
+         WHERE m.workspace_id = $1
+         ORDER BY m.created_at",
+    )
+    .bind(workspace_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// How many OTHER owners this workspace has, for the last-owner guard: a
+/// change to `exclude_user`'s own membership (demote, remove, or a
+/// transfer's demotion of the outgoing owner) is safe only if at least one
+/// owner remains once this user's current role no longer counts.
+pub async fn owner_count_excluding(
+    pool: &ControlPool,
+    workspace_id: Uuid,
+    exclude_user: Uuid,
+) -> AppResult<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_members
+         WHERE workspace_id = $1 AND role = 'owner' AND user_id <> $2",
+    )
+    .bind(workspace_id)
+    .bind(exclude_user)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Insert or update a member's role. Idempotent; used both by invite
+/// acceptance and by `PATCH /workspaces/{id}/members/{user_id}`.
+pub async fn set_role(
+    pool: &ControlPool,
+    workspace_id: Uuid,
+    user_id: Uuid,
+    role: Role,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)
+         ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = $3",
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .bind(role)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn remove_member(pool: &ControlPool, workspace_id: Uuid, user_id: Uuid) -> AppResult<()> {
+    sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
+        .bind(workspace_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Move ownership from `from_user` to `to_user` (already a member) in one
+/// transaction, so the workspace is never observed without an owner
+/// between the two writes.
+pub async fn transfer_ownership(
+    pool: &ControlPool,
+    workspace_id: Uuid,
+    from_user: Uuid,
+    to_user: Uuid,
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE workspace_members SET role = 'admin' WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(workspace_id)
+    .bind(from_user)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE workspace_members SET role = 'owner' WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(workspace_id)
+    .bind(to_user)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }

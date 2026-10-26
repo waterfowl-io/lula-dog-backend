@@ -32,52 +32,92 @@ Needs a Rust toolchain (stable, edition 2024) and a C++ compiler (for a dev
 dependency's build script). SQLite is bundled; nothing else to install for
 the data plane.
 
-The quickest way to run without Supabase at all:
+The quickest way to run with no identity provider at all:
 
 ```sh
 AUTH_MODE=dev cargo run
 ```
 
-`AUTH_MODE=dev` bypasses JWT verification (every request is a fixed dev
-user, overridable with an `X-Dev-User: <uuid>` header) and, with no
-`CONTROL_DATABASE_URL` set, workspace-membership checks are skipped too
-(every workspace id is accessible as `owner`). That starts the API on
-`http://127.0.0.1:3000` with a SQLite file `lula.db` in the current
-directory for the legacy/default workspace
-(`00000000-0000-0000-0000-000000000000`, see
-[`docs/architecture.md`](docs/architecture.md)); the file is created on
-first start and the checked-in migrations (`migrations/`) are applied on
-every start. Try it:
+`AUTH_MODE=dev` (the legacy spelling; canonical is `APP__AUTH__MODE=dev`)
+bypasses JWT verification (every request is a fixed dev user, overridable
+with an `X-Dev-User: <uuid>` header, and always treated as `aal2`) and, with
+no control-plane URL set, workspace-membership checks are skipped too (every
+workspace id is accessible as `owner`). It only activates on that explicit
+value, logs a loud warning, and the server **refuses to start** with it set
+outside `APP_ENV=dev`. That starts the API on `http://127.0.0.1:3000` (or
+wherever `BIND_ADDR`/`APP__SERVER__*` point) with per-workspace SQLite files
+under `DATA_DIR` (see [`docs/architecture.md`](docs/architecture.md)); the
+legacy/default workspace (`00000000-0000-0000-0000-000000000000`) lives there
+too now, not at `DATABASE_URL` directly. Try it:
 
 ```sh
 curl -X POST http://127.0.0.1:3000/w/00000000-0000-0000-0000-000000000000/opportunities \
   -H 'content-type: application/json' -d '{"company": "Acme"}'
 ```
 
-To run against a real Supabase project (or a local one via the Supabase
-CLI): set `SUPABASE_URL` and `CONTROL_DATABASE_URL` (its Postgres
-connection string), leave `AUTH_MODE` unset (defaults to `supabase`), and
-send a real user's JWT as `Authorization: Bearer <token>`. The control-plane
-migrations (`migrations/control/`) apply on startup, separately from the
-per-workspace SQLite migrations.
+To run against a real identity provider without `AUTH_MODE=dev`, don't set
+it at all: `config/dev.toml`'s default (`APP_ENV` unset or `dev`) is
+`auth.mode = "hybrid"`, which verifies BOTH an HS256 token signed with the
+committed dev secret (mint one with `./scripts/dev-token`, see below) and a
+real provider's ES256/RS256 token against its JWKS, on the same running
+server. Point `config/local.toml` (gitignored) or
+`APP__AUTH__JWKS_URL`/`APP__AUTH__ISSUER` at a hosted project to test
+against it locally.
+
+```sh
+cargo run &
+curl -H "Authorization: Bearer $(./scripts/dev-token)" http://127.0.0.1:3000/me
+# aal1 (no second factor yet): every route 403s mfa_required except /me
+curl -i -H "Authorization: Bearer $(./scripts/dev-token --aal1)" http://127.0.0.1:3000/opportunities
+```
+
+### Config: `[server]`/`[database]`/`[auth]`, and everything else
+
+`[server]`, `[database]` and `[auth]` are layered with the `config` crate:
+`config/default.toml` → `config/{APP_ENV}.toml` (`dev` when `APP_ENV` is
+unset) → env vars (`APP__SECTION__KEY`, e.g. `APP__AUTH__JWKS_URL`) →
+`config/local.toml` (gitignored, for pointing local dev at a real provider
+without committing anything). Everything else (`DATA_DIR`, `EXTRACTOR`,
+`CHAT_*`, ...) is still a plain env var, read directly; see the table below.
+
+A few old plain env vars are still read, as DEPRECATED aliases with a
+startup warning, so an existing local setup keeps working:
+
+| Legacy var | Maps to |
+|---|---|
+| `AUTH_MODE=dev` | `auth.mode = "dev"` (canonical: `APP__AUTH__MODE=dev`) |
+| `CONTROL_DATABASE_URL` | the control-plane Postgres URL, overriding `[database] url`/`DATABASE_URL` |
+| `BIND_ADDR` | `APP__SERVER__HOST`/`APP__SERVER__PORT` |
+
+`DATABASE_URL` is now DUAL-canonical with `APP__DATABASE__URL`: a
+`postgres://`/`postgresql://` value is the control-plane URL (what infra's
+Terraform module injects). A `sqlite:` value (the OLD meaning -- the
+legacy/default workspace's data file) is ignored with a warning instead,
+since that workspace now lives under `DATA_DIR` like every other one.
+`SUPABASE_URL`/`SUPABASE_JWT_AUD`/`SUPABASE_JWT_SECRET` are no longer read
+at all; the server refuses to start with a clear message if one is set and
+its `APP__AUTH__*` replacement isn't (see `.env.example`), rather than
+silently ignoring it.
 
 Configuration is by environment variable; a `.env` file is read if present.
 Copy `.env.example` to `.env` to change anything. All variables are optional:
 
 | Variable | Default | |
 |---|---|---|
-| `CONTROL_DATABASE_URL` | unset | Supabase/Postgres control plane. Unset disables workspace-membership enforcement |
-| `AUTH_MODE` | `supabase` | `supabase` or `dev` (bypasses JWT verification; never a fallback, always a loud warning) |
-| `SUPABASE_URL` | | Required when `AUTH_MODE=supabase`; JWKS and issuer are derived from it |
-| `SUPABASE_JWT_AUD` | `authenticated` | Expected JWT `aud` claim |
-| `SUPABASE_JWT_SECRET` | | Legacy HS256 fallback; unset rejects HS256 tokens |
-| `JWKS_CACHE_TTL_SECS` | `300` | JWKS cache TTL; an unknown `kid` refetches immediately regardless |
-| `DEV_USER_ID` | `00000000-…-000000000001` | `AUTH_MODE=dev`'s fixed user id |
-| `DATA_DIR` | `data` | Per-workspace SQLite files live under `DATA_DIR/workspaces/{id}.db` |
+| `APP_ENV` | `dev` | `dev`, `staging` or `prod`; picks `config/{APP_ENV}.toml` and gates the refusals below |
+| `APP__DATABASE__URL` / `DATABASE_URL` | unset | Postgres control plane. Unset disables workspace-membership enforcement |
+| `APP__AUTH__MODE` | `jwks` | `jwks`, `hs256`, `hybrid` or `dev` (dev bypasses JWT verification; never a fallback, always a loud warning, refused outside `APP_ENV=dev`) |
+| `APP__AUTH__JWKS_URL` | | Required for `jwks`/`hybrid`. ES256/RS256 keys, cached by `kid` |
+| `APP__AUTH__JWT_SECRET` | | Required for `hs256`/`hybrid`. Shared secret (local/test only; the dev value is refused outside `APP_ENV=dev`) |
+| `APP__AUTH__ISSUER` | | Expected JWT `iss` claim |
+| `APP__AUTH__AUDIENCE` | `authenticated` | Expected JWT `aud` claim |
+| `DEV_USER_ID` | `00000000-…-000000000001` | `auth.mode = dev`'s fixed user id |
+| `APP__SERVER__HOST` | `0.0.0.0` (`127.0.0.1` in dev) | Listen host |
+| `APP__SERVER__PORT` | `8080` (`3000` in dev) | Listen port |
+| `APP__SERVER__CORS_ORIGINS` | `https://app.lula.dog,http://localhost:5173` | Comma-separated CORS allowlist; bearer-token API, no credentials |
+| `DATA_DIR` | `data` | Per-workspace SQLite files live under `DATA_DIR/workspaces/{id}.db`, including the legacy/default one |
 | `QUERY_MAX_ROWS` | `1000` | Row cap for `POST /w/{ws}/queries/{id}/run` |
 | `QUERY_TIMEOUT_MS` | `5000` | Per-request query timeout |
-| `DATABASE_URL` | `sqlite://lula.db` | SQLite file for the legacy/default workspace only; see `DATA_DIR` |
-| `BIND_ADDR` | `127.0.0.1:3000` | Listen address |
 | `RUST_LOG` | `info` | Log filter |
 | `EXTRACTOR` | `stub` | `stub` or `grok` |
 | `XAI_API_KEY` | | Required when `EXTRACTOR=grok` or `CLASSIFIER=grok` |
@@ -111,10 +151,12 @@ SQLite file to start over.
 It also seeds Jack's default lead-gen target profile (Illinois, packaging-
 buying industries), if none exists yet — see [Lead generation](#lead-generation).
 
-With `CONTROL_DATABASE_URL` configured, `seed` also finds-or-creates a dev
+With a control-plane URL configured, `seed` also finds-or-creates a dev
 user and their "Jack's Packaging" workspace in the control plane (the dev
-user is `AUTH_MODE=dev`'s default, so a locally-running server sees it at
-`GET /me` with no extra setup), then creates the saved queries and the
+user is `auth.mode = "dev"`'s default, so a locally-running server sees it
+at `GET /me` with no extra setup -- and `./scripts/dev-token`'s default
+subject matches it too, for `auth.mode = "hybrid"`), then creates the saved
+queries and the
 "Sales" app definition (pipeline kanban, deals table, stale-deals alerts,
 pipeline-value chart, deal detail page, lead queue) for that workspace --
 see `src/seed.rs` and the committed fixture at
@@ -125,7 +167,8 @@ skips the control-plane bootstrap.
 Every CLI command (`seed`, `import`, `enrich`, `classify`) takes
 `--workspace <uuid>` to pick which workspace's SQLite file to operate on;
 the default is the legacy/default workspace
-(`00000000-0000-0000-0000-000000000000`, i.e. `DATABASE_URL` directly).
+(`00000000-0000-0000-0000-000000000000`, under `DATA_DIR` like every other
+workspace).
 
 ## Test
 
@@ -136,15 +179,16 @@ cargo test
 ```
 
 Tests drive the router in-process against a fresh SQLite file per test, with
-`AUTH_MODE=dev` and no control plane (so workspace membership is bypassed --
-see `tests/common/mod.rs`). The xAI extractor is tested against a local fake
-of the chat completions endpoint, and JWT verification against a loopback
-fake JWKS server (`tests/auth.rs`), so no key or real network is needed
-either way.
+`auth.mode = "dev"` and no control plane (so workspace membership is
+bypassed -- see `tests/common/mod.rs`). The xAI extractor is tested against
+a local fake of the chat completions endpoint, and JWT verification against
+a loopback fake JWKS server (`tests/auth.rs`, which also carries the aal2
+router-walk test), so no key or real network is needed either way.
 
 Control-plane-backed tests (workspace membership/403s, `/me`, `/workspaces`,
-app definitions, saved queries, the query runner, schema introspection --
-`tests/workspaces.rs`, `tests/apps.rs`, `tests/queries.rs`) read
+invites/members/transfer-ownership, app definitions, saved queries, the
+query runner, schema introspection -- `tests/workspaces.rs`,
+`tests/invites.rs`, `tests/apps.rs`, `tests/queries.rs`) read
 `TEST_CONTROL_DATABASE_URL` and skip themselves, printing a note, when it
 isn't set; each creates its own profile/workspace with random ids, so
 they're safe to run in parallel against a shared database. CI
@@ -154,34 +198,65 @@ they're safe to run in parallel against a shared database. CI
 ## API
 
 All bodies are JSON. Errors are `{"error": {"code", "message"}}` with codes
-`bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`,
-`internal`. Unknown request fields are rejected. Timestamps are accepted as
-RFC 3339, RFC 2822, `YYYY-MM-DD HH:MM:SS` or `YYYY-MM-DD`, and always
-returned as `YYYY-MM-DD HH:MM:SS` UTC. The OpenAPI document is served at
+`bad_request`, `unauthorized`, `forbidden`, `mfa_required`, `not_found`,
+`conflict`, `service_unavailable`, `internal`. Unknown request fields are
+rejected. Timestamps are accepted as RFC 3339, RFC 2822,
+`YYYY-MM-DD HH:MM:SS` or `YYYY-MM-DD`, and always returned as
+`YYYY-MM-DD HH:MM:SS` UTC. The OpenAPI document is served at
 `GET /openapi.json`.
 
 Every request except `/health`, `/openapi.json` and
 `/app-definition.schema.json` needs `Authorization: Bearer <jwt>` (or, under
-`AUTH_MODE=dev`, nothing at all). Everything below `/w/{workspace_id}` also
-needs the caller to be a member of that workspace -- a non-member gets 403,
-and a `viewer` member gets 403 on any write. See
-[`docs/architecture.md`](docs/architecture.md).
+`auth.mode = "dev"`, nothing at all). Every one of those also needs `aal2`
+(a second factor on this session) EXCEPT `GET /me`, so the frontend can
+render the TOTP enrollment/challenge step -- below it, 403 `mfa_required`
+(`auth.mode = "dev"` is always treated as `aal2`). Everything below
+`/w/{workspace_id}`, plus `/workspaces/{id}/invites|members|transfer-ownership`,
+also needs the caller to be a member of that workspace -- a non-member gets
+403, and a `viewer` member gets 403 on any write.
+
+Roles, least to most privileged (updated 2026-10-25; see `Role`'s doc
+comment and `Role::require`/`Role::can_assign`, the two functions every
+gate below shares, so none of them can drift apart):
+
+- `viewer`: read-only. No data writes, no chat (data or build mode), no
+  publish/discard/rollback.
+- `member`: `viewer` + write workspace data, build-mode chat, publish,
+  discard and roll back app versions.
+- `admin`: `member` + share/unshare (invite, remove and change the role of
+  `viewer`/`member`/`admin` members) + delete any workspace-level resource
+  or member (today: pending invites, members -- deleting a task or a
+  target profile is ordinary data-write CRUD, open to `member`+, same as
+  creating or editing one).
+- `owner`: `admin` + the only role that may grant or remove `owner` or
+  call `transfer-ownership`. A workspace always keeps at least one owner
+  (409 otherwise). There is no workspace-deletion endpoint yet; if one is
+  added, it stays `owner`-only.
+
+See [`docs/architecture.md`](docs/architecture.md) for the full writeup.
 
 | Method | Path | |
 |---|---|---|
 | GET | `/health` | Liveness, plus a control-plane round trip if one is configured |
 | GET | `/openapi.json` | OpenAPI 3.1 document |
 | GET | `/app-definition.schema.json` | JSON Schema of the app definition format |
-| GET | `/me` | The caller's profile + workspace memberships |
+| GET | `/me` | The caller's profile + workspace memberships (reachable at `aal1`) |
 | GET | `/workspaces` | The caller's workspaces |
 | POST | `/workspaces` | Create a workspace `{name}`; the caller becomes `owner` |
+| GET | `/workspaces/{id}/invites` | List pending invites (admin+) |
+| POST | `/workspaces/{id}/invites` | Invite by email `{email, role}` (admin+; only owner can invite owner) |
+| DELETE | `/workspaces/{id}/invites/{invite_id}` | Revoke a pending invite (admin+) |
+| GET | `/workspaces/{id}/members` | List members (admin+) |
+| PATCH | `/workspaces/{id}/members/{user_id}` | Change role `{role}` (admin+; owner-touching needs owner); 409 if it would leave no owner |
+| DELETE | `/workspaces/{id}/members/{user_id}` | Remove a member (admin+; owner needs owner); 409 if it would leave no owner |
+| POST | `/workspaces/{id}/transfer-ownership` | `{to_user_id}`; caller must already be `owner` |
 | GET | `/w/{ws}/opportunities?stage=` | List, with `open_task_count`, `overdue_task_count`, `stale` |
 | POST | `/w/{ws}/opportunities` | Create (`company` required; `stage` defaults to `lead`) |
 | GET | `/w/{ws}/opportunities/:id` | Deal + timeline + pending proposals + tasks |
 | PATCH | `/w/{ws}/opportunities/:id` | Partial update; `null` clears a nullable field |
 | POST | `/w/{ws}/opportunities/:id/tasks` | Add a task `{title, due_at?}` |
 | PATCH | `/w/{ws}/tasks/:id` | Edit `{title?, due_at?, done?}` |
-| DELETE | `/w/{ws}/tasks/:id` | Delete a task |
+| DELETE | `/w/{ws}/tasks/:id` | Delete a task (member+, like any workspace-data write) |
 | GET | `/w/{ws}/alerts/stale` | Stale deals, longest without a touch first |
 | POST | `/w/{ws}/opportunities/:id/paste` | Paste `{text}`; see below |
 | POST | `/w/{ws}/proposals/:id/accept` | Accept and apply a proposal |
@@ -189,7 +264,7 @@ and a `viewer` member gets 403 on any write. See
 | POST | `/w/{ws}/opportunities/:id/proposals/accept-all` | Accept every pending proposal |
 | POST | `/w/{ws}/opportunities/:id/proposals/dismiss-all` | Reject every pending proposal |
 | GET, POST | `/w/{ws}/target-profiles` | List / create a lead-gen target profile |
-| GET, PATCH, DELETE | `/w/{ws}/target-profiles/:id` | |
+| GET, PATCH, DELETE | `/w/{ws}/target-profiles/:id` | Delete is member+, same reasoning as tasks above |
 | GET | `/w/{ws}/leads?status=&min_score=&industry=&profile_id=&limit=&offset=` | Lead queue; `status` defaults to `new`, sorted by fit score descending |
 | POST | `/w/{ws}/leads/:id/accept` | Create a step-1 opportunity from a lead |
 | POST | `/w/{ws}/leads/:id/reject` | `{reason}` |
@@ -197,8 +272,10 @@ and a `viewer` member gets 403 on any write. See
 | GET, POST | `/w/{ws}/apps` | List / create an app definition `{key, name}` |
 | GET | `/w/{ws}/apps/:app` | Published version, or the latest if nothing is published |
 | GET, POST | `/w/{ws}/apps/:app/versions` | List versions / create one `{definition}` (validated) |
-| POST | `/w/{ws}/apps/:app/versions/:version/publish` | Move the published pointer |
-| POST | `/w/{ws}/apps/:app/rollback` | `{version}`: copy an old version into a new one and publish it |
+| POST | `/w/{ws}/apps/:app/versions/:version/publish` | Move the published pointer (member+) |
+| POST | `/w/{ws}/apps/:app/versions/:version/discard` | Mark a draft discarded; refuses the published version (member+) |
+| POST | `/w/{ws}/apps/:app/rollback` | `{version}`: copy an old version into a new one and publish it (member+) |
+| POST | `/w/{ws}/apps/:app/chat` | Chat turn, SSE; both data and build mode need `member`+ |
 | GET, POST | `/w/{ws}/queries` | List / create a saved query `{key, name, description?, sql_text, params?}` |
 | GET | `/w/{ws}/queries/:id` | |
 | POST | `/w/{ws}/queries/:id/run` | `{params?}` → `{query_id, sql, columns, rows, row_count, truncated, elapsed_ms}` |

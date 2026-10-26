@@ -25,6 +25,7 @@ pub mod extractor;
 pub mod importers;
 pub mod leads;
 pub mod me;
+pub mod members;
 pub mod opportunities;
 pub mod paste;
 pub mod places;
@@ -134,6 +135,10 @@ pub fn classifier_from_config(config: &ClassifierConfig) -> anyhow::Result<Arc<d
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "a flat route table reads best as one list"
+)]
 pub fn router(state: AppState) -> Router {
     let workspace_routes = Router::new()
         .route(
@@ -226,6 +231,26 @@ pub fn router(state: AppState) -> Router {
             "/workspaces",
             get(me::list_workspaces).post(me::create_workspace),
         )
+        .route(
+            "/workspaces/{workspace_id}/invites",
+            get(members::list_invites).post(members::create_invite),
+        )
+        .route(
+            "/workspaces/{workspace_id}/invites/{invite_id}",
+            axum::routing::delete(members::delete_invite),
+        )
+        .route(
+            "/workspaces/{workspace_id}/members",
+            get(members::list_members),
+        )
+        .route(
+            "/workspaces/{workspace_id}/members/{user_id}",
+            patch(members::update_member_role).delete(members::remove_member),
+        )
+        .route(
+            "/workspaces/{workspace_id}/transfer-ownership",
+            post(members::transfer_ownership),
+        )
         .nest("/w/{workspace_id}", workspace_routes)
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http())
@@ -290,6 +315,13 @@ pub async fn health(State(state): State<AppState>) -> AppResult<Json<Health>> {
         me::get,
         me::list_workspaces,
         me::create_workspace,
+        members::list_invites,
+        members::create_invite,
+        members::delete_invite,
+        members::list_members,
+        members::update_member_role,
+        members::remove_member,
+        members::transfer_ownership,
         app_definition::schema_json,
         opportunities::list,
         opportunities::create,

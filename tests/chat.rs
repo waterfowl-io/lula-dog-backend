@@ -461,12 +461,35 @@ async fn edit_pipeline_is_a_coming_soon_stub_not_a_draft() {
     assert_eq!(versions.as_array().unwrap().len(), 1, "{versions:?}");
 }
 
+/// Build mode requires `member` or above (Nolan's 2026-10-25 role matrix
+/// update: member write access covers build-mode chat, publish, discard
+/// and rollback, not just admin/owner as the original plan had it).
 #[tokio::test]
-async fn build_mode_requires_the_admin_or_owner_role() {
+async fn build_mode_requires_the_member_role_or_above() {
     let Some(app) = TestApp::with_control().await else {
         return;
     };
     create_app(&app, "sales").await;
+    saved_query(&app, "deals_table", "SELECT 'Acme' AS company").await;
+    seed_version(
+        &app,
+        "sales",
+        json!({
+            "version": 1,
+            "pages": [{
+                "id": "pipeline",
+                "path": "/",
+                "title": "Pipeline",
+                "layout": {"type": "component", "component_id": "deals"},
+                "components": [{
+                    "id": "deals",
+                    "type": "table",
+                    "query": {"query": "deals_table"},
+                }],
+            }],
+        }),
+    )
+    .await;
     let control = app.control.as_ref().unwrap();
     let member = Uuid::new_v4();
     lula_dog_backend::control::profiles::upsert_from_jwt(control, member, "member@test.example")
@@ -488,9 +511,12 @@ async fn build_mode_requires_the_admin_or_owner_role() {
             json!({"mode": "build", "message": "add a metric card"}),
         )
         .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(events_named(&parse_sse(&body), "draft_created").len(), 1);
 
-    // A viewer is refused the same way.
+    // A viewer still can't reach the route at all (any method but
+    // GET/HEAD/OPTIONS is refused by `workspace_db::scope` before the
+    // build-mode check even runs; see `viewer_role_cannot_reach_chat_at_all`).
     let viewer = Uuid::new_v4();
     lula_dog_backend::control::profiles::upsert_from_jwt(control, viewer, "viewer2@test.example")
         .await

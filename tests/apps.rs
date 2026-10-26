@@ -10,9 +10,32 @@
 
 mod common;
 
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use common::TestApp;
 use serde_json::json;
+use uuid::Uuid;
+
+/// Add `user_id` to `app`'s default workspace with `role`, provisioning
+/// their profile first (membership rows reference `profiles`) -- same
+/// helper as `tests/invites.rs::add_member`, duplicated rather than shared
+/// across integration test crates (each compiles as its own binary).
+async fn add_member(
+    app: &TestApp,
+    user_id: Uuid,
+    role: lula_dog_backend::control::workspaces::Role,
+) {
+    let control = app.control.as_ref().unwrap();
+    lula_dog_backend::control::profiles::upsert_from_jwt(
+        control,
+        user_id,
+        &format!("{user_id}@test.example"),
+    )
+    .await
+    .unwrap();
+    lula_dog_backend::control::workspaces::set_role(control, app.workspace_id, user_id, role)
+        .await
+        .unwrap();
+}
 
 async fn create_a_saved_query(app: &TestApp, key: &str) {
     let (status, body) = app
@@ -208,6 +231,114 @@ async fn rollback_creates_a_new_version_and_republishes() {
     let (status, detail) = app.get(&format!("/apps/{app_id}")).await;
     assert_eq!(status, StatusCode::OK, "{detail}");
     assert_eq!(detail["version"]["version"], 3);
+}
+
+#[tokio::test]
+async fn publish_discard_and_rollback_require_member_or_above() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    create_a_saved_query(&app, "gate_metric").await;
+    let (_, created) = app
+        .post("/apps", json!({"key": "gated", "name": "Gated"}))
+        .await;
+    let app_id = created["id"].as_str().unwrap();
+    let (_, v1) = app
+        .post(
+            &format!("/apps/{app_id}/versions"),
+            json!({"definition": minimal_definition("gate_metric")}),
+        )
+        .await;
+    let v1_id = v1["id"].as_str().unwrap().to_owned();
+    let (status, published) = app
+        .post(
+            &format!("/apps/{app_id}/versions/{v1_id}/publish"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+    let (_, v2) = app
+        .post(
+            &format!("/apps/{app_id}/versions"),
+            json!({"definition": minimal_definition("gate_metric")}),
+        )
+        .await;
+    let v2_id = v2["id"].as_str().unwrap().to_owned();
+
+    let viewer = Uuid::new_v4();
+    add_member(
+        &app,
+        viewer,
+        lula_dog_backend::control::workspaces::Role::Viewer,
+    )
+    .await;
+    let member = Uuid::new_v4();
+    add_member(
+        &app,
+        member,
+        lula_dog_backend::control::workspaces::Role::Member,
+    )
+    .await;
+
+    // discard: a viewer is refused (v2 is still a draft), a member isn't.
+    let (status, body) = app
+        .request_as(
+            viewer,
+            Method::POST,
+            &format!("/apps/{app_id}/versions/{v2_id}/discard"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = app
+        .request_as(
+            member,
+            Method::POST,
+            &format!("/apps/{app_id}/versions/{v2_id}/discard"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // publish: same split.
+    let (status, body) = app
+        .request_as(
+            viewer,
+            Method::POST,
+            &format!("/apps/{app_id}/versions/{v1_id}/publish"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = app
+        .request_as(
+            member,
+            Method::POST,
+            &format!("/apps/{app_id}/versions/{v1_id}/publish"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // rollback: same split.
+    let (status, body) = app
+        .request_as(
+            viewer,
+            Method::POST,
+            &format!("/apps/{app_id}/rollback"),
+            Some(json!({"version": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = app
+        .request_as(
+            member,
+            Method::POST,
+            &format!("/apps/{app_id}/rollback"),
+            Some(json!({"version": 1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

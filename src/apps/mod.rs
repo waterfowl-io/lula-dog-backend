@@ -14,6 +14,7 @@ use crate::AppState;
 use crate::app_definition::{self, AppDefinitionDoc};
 use crate::control::ControlPool;
 use crate::control::app_definitions::{self, AppDefinition, AppDefinitionVersion};
+use crate::control::workspaces::Role;
 use crate::error::{AppError, AppResult};
 use crate::extract::ApiJson;
 use crate::workspace_db::WorkspaceContext;
@@ -231,7 +232,10 @@ pub async fn get_version(
 
 /// Mark a draft version discarded. Refuses the currently published version;
 /// versions stay an immutable, append-only log, so this never deletes a row
-/// -- see `app_definitions::discard_version`.
+/// -- see `app_definitions::discard_version`. Requires `member` or above
+/// (`Role::require`); `workspace_db::scope` already refuses a `viewer`
+/// this whole route, but the explicit check here names the reason
+/// directly, the same way the chat build-mode gate does.
 #[utoipa::path(
     post,
     path = "/w/{workspace_id}/apps/{app}/versions/{version}/discard",
@@ -252,6 +256,7 @@ pub async fn discard(
     ws: WorkspaceContext,
     Path(VersionParam { app, version }): Path<VersionParam>,
 ) -> AppResult<Json<AppDefinitionVersion>> {
+    ws.role.require(Role::Member)?;
     let control = control(&state)?;
     let app_id = app_definitions::resolve_id(control, ws.id, &app).await?;
     app_definitions::fetch(control, ws.id, app_id).await?;
@@ -269,6 +274,8 @@ pub struct PublishParam {
 }
 
 /// Move the published pointer to `version` (must belong to this app).
+/// Requires `member` or above (`Role::require`) -- see `discard`'s doc
+/// comment.
 #[utoipa::path(
     post,
     path = "/w/{workspace_id}/apps/{app}/versions/{version}/publish",
@@ -289,6 +296,7 @@ pub async fn publish(
     ws: WorkspaceContext,
     Path(PublishParam { app, version }): Path<PublishParam>,
 ) -> AppResult<Json<AppDefinition>> {
+    ws.role.require(Role::Member)?;
     let control = control(&state)?;
     let app = app_definitions::resolve_id(control, ws.id, &app).await?;
     Ok(Json(
@@ -306,7 +314,8 @@ pub struct RollbackRequest {
 
 /// Roll back to an earlier version: copies its `definition` into a brand
 /// new version (history stays an immutable, append-only log) and publishes
-/// that new version.
+/// that new version. Requires `member` or above (`Role::require`) -- see
+/// `discard`'s doc comment.
 #[utoipa::path(
     post,
     path = "/w/{workspace_id}/apps/{app}/rollback",
@@ -327,6 +336,7 @@ pub async fn rollback(
     Path(AppIdParam { app }): Path<AppIdParam>,
     ApiJson(req): ApiJson<RollbackRequest>,
 ) -> AppResult<Json<AppDefinitionVersion>> {
+    ws.role.require(Role::Member)?;
     let control = control(&state)?;
     let app = app_definitions::resolve_id(control, ws.id, &app).await?;
     app_definitions::fetch(control, ws.id, app).await?;

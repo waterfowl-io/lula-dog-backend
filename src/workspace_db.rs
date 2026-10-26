@@ -126,10 +126,8 @@ pub async fn scope(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     );
-    if is_write && !role.can_write() {
-        return Err(AppError::Forbidden(
-            "the viewer role cannot modify workspace data".to_owned(),
-        ));
+    if is_write {
+        role.require(Role::Member)?;
     }
     let pool = state
         .workspaces

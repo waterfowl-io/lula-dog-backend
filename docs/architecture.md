@@ -9,12 +9,21 @@ the main [`README.md`](../README.md) and [`docs/lead-gen.md`](lead-gen.md).
 
 ## Control plane vs. data plane
 
-**Control plane (Supabase Postgres, `CONTROL_DATABASE_URL`):** everything
-about *who* and *what*, never customer data:
+**Control plane (Postgres -- Supabase's project database in production,
+`DATABASE_URL`/`APP__DATABASE__URL`, or the legacy `CONTROL_DATABASE_URL`):**
+everything about *who* and *what*, never customer data:
 
-- `profiles` — one row per Supabase Auth user, keyed by their auth user id.
+- `profiles` — one row per authenticated user, keyed by their verified
+  JWT `sub`. No foreign key to any Supabase-managed table: this service
+  verifies identity itself (`src/auth`) and connects to Postgres directly
+  as a privileged role, so there is nothing to reference.
 - `workspaces`, `workspace_members` — a workspace and its members, each with
-  a role (`owner`, `admin`, `member`, `viewer`).
+  a role (`owner`, `admin`, `member`, `viewer`; see `Role::can_assign`).
+- `workspace_invites` — pending invites by email, claimed automatically the
+  first time the invited address is seen in a verified token (see
+  [Request flow](#request-flow-jwt--user--membership--workspace-pool)
+  below and `src/control/invites.rs`). Phase 1: the operator creates the
+  auth user from the Supabase dashboard; there is no API-driven invite yet.
 - `app_definitions`, `app_definition_versions` — AI-generated apps as
   versioned JSON (see [App definitions are data](#app-definitions-are-data)).
 - `saved_queries` — named SQL a component binds to.
@@ -24,18 +33,14 @@ about *who* and *what*, never customer data:
   schedule, enabled). Created by this step's migration; no runner executes
   them yet.
 
-Migrations live in `migrations/control/`, applied to `CONTROL_DATABASE_URL`
-on startup, separate from the data-plane SQLite migrations in `migrations/`.
-Real Supabase projects already have an `auth` schema (managed by GoTrue); the
-control-plane migration only creates a minimal `auth.users`/`auth.uid()`
-stand-in *if they don't already exist* (a bare local/CI Postgres), so it
-never touches a real project's `auth` schema. RLS policies are included for
-the tables the frontend might read directly with the Supabase
-anon/authenticated role (`profiles`: self; `workspaces`/`workspace_members`/
-`app_definitions`/`app_definition_versions`/`saved_queries`: members can
-select) — the backend itself connects as the table owner, which Postgres
-always exempts from RLS, so these policies change nothing for the backend's
-own queries.
+Migrations live in `migrations/control/`, applied on startup, separate from
+the data-plane SQLite migrations in `migrations/`. They never reference
+Supabase's `auth` schema (no `auth.users` stand-in, no `auth.uid()`, no RLS
+keyed on either): this service verifies identity and workspace membership
+itself, in Rust (`src/auth`, `src/workspace_db::scope`, `src/members.rs`),
+not through Postgres row-level security, so the migration applies cleanly
+to a bare Postgres with no `auth` schema at all -- a real Supabase project's
+`auth` schema is simply never touched.
 
 **Data plane (SQLite, one file per workspace):** customer data never lives
 in Postgres. Editable app data (opportunities, tasks, timeline, proposals,
@@ -45,39 +50,70 @@ created and migrated on first use under `DATA_DIR/workspaces/{id}.db` (see
 (see [below](#ducklake-later)); DuckDB queries across both.
 
 One exception, for backward compatibility: the workspace id
-`00000000-0000-0000-0000-000000000000` (`config::DEFAULT_WORKSPACE_ID`) reads
-`DATABASE_URL` directly instead of a `DATA_DIR` path, so a pre-step-3
-single-tenant setup (`cargo run` with just `DATABASE_URL` set) keeps reading
-the same file.
+`00000000-0000-0000-0000-000000000000` (`config::DEFAULT_WORKSPACE_ID`) is
+still the implicit default for the CLI's `--workspace` flag, but its data
+now lives under `DATA_DIR` like every other workspace (it no longer reads
+`DATABASE_URL` directly -- that name is now the control-plane Postgres URL).
 
 ## Request flow: JWT → user → membership → workspace pool
 
-1. **Auth** (`src/auth`). `AuthUser` is an Axum extractor. Under
-   `AUTH_MODE=supabase` (the default), it reads `Authorization: Bearer
-   <jwt>`, decodes the header to find `alg`/`kid`, and verifies: ES256/RS256
-   against the project's JWKS (`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`,
-   cached with a TTL, refetched immediately if the token names an unknown
-   `kid`), or HS256 against `SUPABASE_JWT_SECRET` (the legacy scheme). `exp`,
-   `aud` and `iss` are all validated. The result is `{id: Uuid, email:
-   String}` from the token's `sub`/`email` claims.
+1. **Auth** (`src/auth`, ported from Desde0's `TokenVerifier`/`OidcVerifier`
+   seam). `AuthUser` is an Axum extractor. Under `auth.mode = "jwks"` (the
+   default), `"hs256"` or `"hybrid"`, it reads `Authorization: Bearer <jwt>`,
+   decodes the header to find `alg`/`kid`, and verifies: ES256/RS256 against
+   `auth.jwks_url` (cached by `kid`, refetched on a miss), or HS256 against
+   `auth.jwt_secret`. `hybrid` configures both and dispatches per token by
+   its header `alg`, so a locally-minted HS256 token and a real provider's
+   ES256/RS256 token validate against the same running server; algorithm
+   confusion is impossible by construction (see `src/auth/oidc.rs`'s module
+   doc). `exp`, `aud` and `iss` are all validated, and the token must carry
+   an `email` claim (checked in the extractor, since invite acceptance needs
+   it). The result is `{id: Uuid, email: String}` from the token's
+   `sub`/`email` claims, plus the `aal`/`app_metadata` claims used below and
+   by `src/chat`'s build-mode gate.
 
-   Under `AUTH_MODE=dev`, verification is skipped entirely: every request is
-   a fixed dev user (`DEV_USER_ID`, default `config::DEFAULT_DEV_USER_ID`),
-   overridable per-request with `X-Dev-User: <uuid>`. This only activates on
-   an explicit `AUTH_MODE=dev` (never a fallback) and logs a loud warning on
-   startup.
+   Under `auth.mode = "dev"` (legacy: `AUTH_MODE=dev`), verification is
+   skipped entirely: every request is a fixed dev user (`DEV_USER_ID`,
+   default `config::DEFAULT_DEV_USER_ID`), overridable per-request with
+   `X-Dev-User: <uuid>`, and always treated as `aal2`. This only activates
+   on an explicit `dev` mode (never a fallback), logs a loud warning on
+   startup, and `Config::validate` refuses to boot in it outside
+   `Env::Dev` (`APP_ENV=dev`).
+
+   Every route requires `aal2` (a second factor on this session) except
+   `GET /me`, so the frontend can render the TOTP enrollment/challenge step
+   before anything else; below it, 403 `mfa_required`
+   (`AppError::MfaRequired`), distinct from the generic `forbidden` a
+   membership check returns. `tests/auth.rs`'s router-walk test enumerates
+   every route from the live OpenAPI document and asserts this.
+
+   The same extraction step provisions: it upserts the caller's `profiles`
+   row and claims any still-pending `workspace_invites` for their verified
+   email (`src/auth::provision`, best-effort with a 500ms ceiling, same
+   rule `AUTH_MODE=dev` demonstrates elsewhere -- a transient DB hiccup must
+   not reject an already-authenticated caller). See
+   [Invites and members](#invites-and-members) below.
 
 2. **Workspace membership** (`src/workspace_db.rs::scope`, a middleware on
    every `/w/{workspace_id}/...` route). Given the authenticated user and the
    path's `workspace_id`, it looks up the user's role in
    `workspace_members`. No row → 403. A write (any method but
-   GET/HEAD/OPTIONS) from a `viewer` → 403. If `CONTROL_DATABASE_URL` isn't
+   GET/HEAD/OPTIONS) from a `viewer` → 403. If no control-plane URL is
    configured, this check is skipped entirely and every workspace id is
    treated as accessible with role `owner` — a deliberate, documented bypass
-   (logged once at startup, like `AUTH_MODE=dev`) so the data plane and most
-   of the test suite work without standing up Postgres. Tests that need real
-   enforcement (`tests/workspaces.rs`) go through `TestApp::with_control`,
-   gated on `TEST_CONTROL_DATABASE_URL`.
+   (logged once at startup, like `auth.mode = "dev"`) so the data plane and
+   most of the test suite work without standing up Postgres. Tests that need
+   real enforcement (`tests/workspaces.rs`, `tests/invites.rs`) go through
+   `TestApp::with_control`, gated on `TEST_CONTROL_DATABASE_URL`.
+
+   `/workspaces/{id}/invites`, `/workspaces/{id}/members` and
+   `/workspaces/{id}/transfer-ownership` (`src/members.rs`) are siblings of
+   `/workspaces`, not nested under `/w/{workspace_id}`, so they resolve
+   membership the same way but enforce their own `admin`-or-above gate on
+   top of it, plus `Role::can_assign` for owner-touching changes and a
+   last-owner check before any demotion or removal (409 if it would leave
+   the workspace with no owner). See
+   [Invites and members](#invites-and-members).
 
 3. **Workspace pool** (`src/workspace_db.rs::WorkspaceRegistry`). The
    middleware resolves (creating and migrating on first use) the
@@ -92,6 +128,87 @@ the same file.
 membership to check yet): they only need `AuthUser`, and `POST /workspaces`
 both creates the control-plane row (creator becomes `owner`) and the
 workspace's SQLite file.
+
+## Invites and members
+
+Roles, least to most privileged (this is the matrix Nolan gave on
+2026-10-25, which supersedes the auth plan's original one -- see `Role`'s
+doc comment in `src/control/workspaces.rs`, the single source of truth):
+
+- `viewer`: read-only. No data writes, no chat (data or build mode), no
+  publish/discard/rollback.
+- `member`: `viewer` + write workspace data, build-mode chat, publish,
+  discard and roll back app versions.
+- `admin`: `member` + share/unshare (invite, remove and change the role of
+  `viewer`/`member`/`admin` members) + delete any workspace-level resource
+  or member.
+- `owner`: `admin` + the only role that may grant or remove `owner` or
+  call `transfer-ownership`. A workspace always keeps at least one owner.
+
+Every gate that enforces a minimum role -- `workspace_db::scope` (workspace
+data writes, build-mode chat, publish/discard/rollback: all `member`+),
+`members::require_admin` (`admin`+) and the chat build-mode check -- goes
+through the same `Role::require(self, min)` (`src/control/workspaces.rs`),
+so none of them can quietly compare differently from the others. `src/
+actions::dispatch`, the action-dispatch layer chat's data-mode write tools
+and the HTTP write endpoints both call into, deliberately has no role
+parameter at all: both callers already sit behind the one `scope` gate on
+the same route, so there is nothing to duplicate there.
+
+**Which DELETE routes need `admin`+ ("delete any workspace-level resource
+or member") versus `member`+ (ordinary data CRUD) -- enumerated:**
+
+| Route | Minimum role | Why |
+|---|---|---|
+| `DELETE /workspaces/{id}/invites/{invite_id}` | `admin` | A workspace-level resource (who can get in); `members::require_admin` |
+| `DELETE /workspaces/{id}/members/{user_id}` | `admin` (owner needs owner) | A member of the workspace itself; `members::require_admin` + `Role::can_assign` |
+| `DELETE /w/{ws}/tasks/{id}` | `member` | Ordinary workspace data, the same bucket as creating/editing a task -- not "the workspace" or "a member" |
+| `DELETE /w/{ws}/target-profiles/{id}` | `member` | Same reasoning as tasks |
+
+Undoing a chat action (`POST .../chat/actions/{id}/undo`) isn't a delete
+in this sense either, even though undoing a `task.create` happens to
+delete the task row: it's a POST that reverses one specific write the
+caller who's already in this conversation made, gated the same `member`+
+way as every other data write under `/w/{workspace_id}`, not a standalone
+deletion capability. There's no "delete your own draft" endpoint distinct
+from `discard` (`member`+, see above) to make a separate call about.
+Workspace deletion, if it's ever added, should stay `owner`-only per the
+original plan -- nothing in the matrix update says otherwise, and no such
+endpoint exists today.
+
+Who may change a role is one function, `Role::can_assign(actor, from, to)`
+(`src/control/workspaces.rs`), tested as a table in `src/members.rs`:
+`from`/`to` are `None` for "no membership yet" (an invite) and "membership
+removed", so the same rule covers inviting, promoting, demoting, removing
+and transferring ownership (modeled as `owner -> owner`, since transferring
+IS granting `owner` to someone else):
+
+- An `admin` may invite, promote, demote or remove `viewer`/`member`/`admin`.
+- Only an `owner` may grant or remove `owner` -- which is also why only an
+  owner may call `POST /workspaces/{id}/transfer-ownership`.
+- Below `admin`, nothing is assignable; `viewer`/`member` can't even invite.
+
+A change is additionally refused with 409 if it would leave the workspace
+with no owner at all (`workspaces::owner_count_excluding`) -- checked
+before any demotion or removal, never assumed safe just because the role
+pair passed `can_assign`.
+
+**Creating the auth user is phase 1, following Desde0**: the operator
+clicks "Invite user" in the Supabase dashboard. This service's own
+`workspace_invites` table is what routes that person into the right
+workspace with the right role the first time they're seen here:
+`POST /workspaces/{id}/invites {email, role}` creates a pending row
+(14-day expiry), and `src/auth::provision` claims it automatically on the
+invited address's first authenticated request, matched on the VERIFIED
+`email` claim only (never a client-supplied one) and only while unaccepted
+and unexpired. Phase 2 (not built yet) would add `IdentityAdmin::invite` so
+the operator never has to touch the dashboard -- see Desde0's
+`src/auth/identity.rs` for the shape.
+
+Invite/member endpoints are workspace-scoped: an invite or member id that
+belongs to a DIFFERENT workspace than the one in the URL reads as 404 (or,
+if the caller isn't even a member of the url's workspace, the same 403 a
+data-plane route gives a non-member) -- never a cross-workspace leak.
 
 ## App definitions are data
 
