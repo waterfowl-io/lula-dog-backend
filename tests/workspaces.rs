@@ -15,9 +15,23 @@ mod common;
 
 use axum::http::{Method, StatusCode};
 use common::TestApp;
+use lula_dog_backend::control::profiles;
+use lula_dog_backend::control::workspaces::{self, Role};
 use serde_json::{Value, json};
 use utoipa::OpenApi as _;
 use uuid::Uuid;
+
+/// Add `user_id` to `app`'s default workspace with `role`, provisioning
+/// their profile first (membership rows reference `profiles`).
+async fn add_member(app: &TestApp, user_id: Uuid, role: Role) {
+    let control = app.control.as_ref().unwrap();
+    profiles::upsert_from_jwt(control, user_id, &format!("{user_id}@test.example"))
+        .await
+        .unwrap();
+    workspaces::set_role(control, app.workspace_id, user_id, role)
+        .await
+        .unwrap();
+}
 
 #[tokio::test]
 async fn me_returns_profile_and_memberships() {
@@ -229,6 +243,118 @@ async fn viewer_gets_403_on_every_mutating_route() {
         checked > 10,
         "the walk exercised too few routes ({checked}) to be load-bearing"
     );
+}
+
+/// Finding 6 (prompt-backend-delete.md): Nolan's matrix makes EVERY delete
+/// `admin`+, with no carve-out for ordinary workspace data -- the previous
+/// run left `DELETE /w/{ws}/tasks/{id}` and `DELETE
+/// /w/{ws}/target-profiles/{id}` at `member`+. Router-walk style, like
+/// `viewer_gets_403_on_every_mutating_route` above: every DELETE route
+/// under `/w/{workspace_id}`, enumerated from the live OpenAPI document,
+/// must refuse a `member` with 403.
+#[tokio::test]
+async fn member_gets_403_on_every_data_plane_delete_route() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let member = Uuid::new_v4();
+    add_member(&app, member, Role::Member).await;
+
+    let doc = lula_dog_backend::ApiDoc::openapi();
+    let dummy = Uuid::new_v4().to_string();
+    let mut checked = 0;
+    for (path, item) in &doc.paths.paths {
+        if item.delete.is_none() || !path.starts_with("/w/{workspace_id}") {
+            continue;
+        }
+        let concrete = path
+            .replace("{workspace_id}", &app.workspace_id.to_string())
+            .split('/')
+            .map(|seg| {
+                if seg.starts_with('{') && seg.ends_with('}') {
+                    dummy.as_str()
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        checked += 1;
+        let (status, body) = app
+            .request_as(member, Method::DELETE, &concrete, None)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "DELETE {path} should refuse a member: {body}"
+        );
+    }
+    assert!(
+        checked >= 2,
+        "the walk exercised too few DELETE routes ({checked}) to be load-bearing"
+    );
+}
+
+/// Finding 6, the other half: an `admin` actually can delete ordinary
+/// workspace data, not just invites/members.
+#[tokio::test]
+async fn admin_can_delete_a_task_and_a_target_profile_a_member_cannot() {
+    let Some(app) = TestApp::with_control().await else {
+        return;
+    };
+    let member = Uuid::new_v4();
+    let admin = Uuid::new_v4();
+    add_member(&app, member, Role::Member).await;
+    add_member(&app, admin, Role::Admin).await;
+
+    let opportunity_id = app
+        .create_opportunity(json!({"company": "Delete Co"}))
+        .await;
+    let (status, task) = app
+        .post(
+            &format!("/opportunities/{opportunity_id}/tasks"),
+            json!({"title": "follow up"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{task}");
+    let task_id = task["id"].as_i64().unwrap();
+
+    let (status, profile) = app
+        .post(
+            "/target-profiles",
+            json!({"name": "Delete-able profile", "min_fit_score": 0}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{profile}");
+    let profile_id = profile["id"].as_i64().unwrap();
+
+    let (status, body) = app
+        .request_as(member, Method::DELETE, &format!("/tasks/{task_id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = app
+        .request_as(
+            member,
+            Method::DELETE,
+            &format!("/target-profiles/{profile_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = app
+        .request_as(admin, Method::DELETE, &format!("/tasks/{task_id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = app
+        .request_as(
+            admin,
+            Method::DELETE,
+            &format!("/target-profiles/{profile_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
 
 #[tokio::test]

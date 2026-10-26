@@ -18,9 +18,10 @@ use crate::error::{AppError, AppResult};
 /// - `member`: `viewer` + write workspace data, build-mode chat, publish,
 ///   discard and roll back app versions.
 /// - `admin`: `member` + share/unshare (invite, remove and change the role
-///   of `viewer`/`member`/`admin` members -- see `can_assign`) + delete any
-///   workspace-level resource or member (invites, members; see
-///   `crate::members` and `docs/architecture.md`'s DELETE-route table).
+///   of `viewer`/`member`/`admin` members -- see `can_assign`) + EVERY
+///   delete, full stop: invites, members, and ordinary workspace data
+///   (tasks, target profiles, ...) alike -- see `crate::members` and
+///   `docs/architecture.md`'s DELETE-route table.
 /// - `owner`: `admin` + the only role that may grant or remove `owner` or
 ///   call `transfer-ownership` (`can_assign`). A workspace always keeps at
 ///   least one owner (`owner_count_excluding`). Deleting the whole
@@ -50,9 +51,10 @@ impl Role {
 
     /// The one minimum-role check every gate in the codebase goes through --
     /// `workspace_db::scope` (workspace data writes, build-mode chat and
-    /// publish/discard/rollback, all `member`+), `members::require_admin`
-    /// (`admin`+) and the chat build-mode gate alike -- so none of them can
-    /// quietly compare roles differently from the others.
+    /// publish/discard/rollback need `member`+; a DELETE needs `admin`+),
+    /// `members::require_admin` (`admin`+) and the chat build-mode gate
+    /// alike -- so none of them can quietly compare roles differently from
+    /// the others.
     pub fn require(self, min: Self) -> AppResult<()> {
         if self < min {
             return Err(AppError::Forbidden(format!(

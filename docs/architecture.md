@@ -146,35 +146,46 @@ doc comment in `src/control/workspaces.rs`, the single source of truth):
   call `transfer-ownership`. A workspace always keeps at least one owner.
 
 Every gate that enforces a minimum role -- `workspace_db::scope` (workspace
-data writes, build-mode chat, publish/discard/rollback: all `member`+),
-`members::require_admin` (`admin`+) and the chat build-mode check -- goes
-through the same `Role::require(self, min)` (`src/control/workspaces.rs`),
-so none of them can quietly compare differently from the others. `src/
-actions::dispatch`, the action-dispatch layer chat's data-mode write tools
-and the HTTP write endpoints both call into, deliberately has no role
-parameter at all: both callers already sit behind the one `scope` gate on
-the same route, so there is nothing to duplicate there.
+data writes, build-mode chat, publish/discard/rollback need `member`+; a
+DELETE needs `admin`+), `members::require_admin` (`admin`+) and the chat
+build-mode check -- goes through the same `Role::require(self, min)`
+(`src/control/workspaces.rs`), so none of them can quietly compare
+differently from the others. `src/actions::dispatch`, the action-dispatch
+layer chat's data-mode write tools and the HTTP write endpoints both call
+into, deliberately has no role parameter at all: both callers already sit
+behind the one `scope` gate on the same route, so there is nothing to
+duplicate there. It also has no action that deletes anything -- see below.
 
-**Which DELETE routes need `admin`+ ("delete any workspace-level resource
-or member") versus `member`+ (ordinary data CRUD) -- enumerated:**
+**Every DELETE route is `admin`+ (Nolan, 2026-10-25: "delete any
+workspace-level resource or member" -- no carve-out for ordinary data),
+enumerated so a new one can't quietly ship at `member`+:**
 
 | Route | Minimum role | Why |
 |---|---|---|
-| `DELETE /workspaces/{id}/invites/{invite_id}` | `admin` | A workspace-level resource (who can get in); `members::require_admin` |
-| `DELETE /workspaces/{id}/members/{user_id}` | `admin` (owner needs owner) | A member of the workspace itself; `members::require_admin` + `Role::can_assign` |
-| `DELETE /w/{ws}/tasks/{id}` | `member` | Ordinary workspace data, the same bucket as creating/editing a task -- not "the workspace" or "a member" |
-| `DELETE /w/{ws}/target-profiles/{id}` | `member` | Same reasoning as tasks |
+| `DELETE /workspaces/{id}/invites/{invite_id}` | `admin` (owner-role invite needs owner) | `members::require_admin` + `Role::can_assign` |
+| `DELETE /workspaces/{id}/members/{user_id}` | `admin` (owner needs owner) | `members::require_admin` + `Role::can_assign` |
+| `DELETE /w/{ws}/tasks/{id}` | `admin` | `workspace_db::scope`: any DELETE under `/w/{workspace_id}` needs `admin`+ |
+| `DELETE /w/{ws}/target-profiles/{id}` | `admin` | Same gate as tasks |
 
-Undoing a chat action (`POST .../chat/actions/{id}/undo`) isn't a delete
-in this sense either, even though undoing a `task.create` happens to
-delete the task row: it's a POST that reverses one specific write the
-caller who's already in this conversation made, gated the same `member`+
-way as every other data write under `/w/{workspace_id}`, not a standalone
-deletion capability. There's no "delete your own draft" endpoint distinct
-from `discard` (`member`+, see above) to make a separate call about.
-Workspace deletion, if it's ever added, should stay `owner`-only per the
-original plan -- nothing in the matrix update says otherwise, and no such
-endpoint exists today.
+Undoing a chat action (`POST .../chat/actions/{id}/undo`) isn't a delete in
+this sense, even though undoing a `task.create` happens to delete the task
+row it created: it's a POST that reverses one specific write the caller
+who's already in this conversation made, gated the same `member`+ way as
+every other data write under `/w/{workspace_id}`, not a standalone deletion
+capability -- and it can't be pointed at an arbitrary record, since the
+row(s) it touches come from the stored `Undo` payload the *original*
+action recorded, never from the undo request itself. There's no "delete
+your own draft" endpoint distinct from `discard` (`member`+, see above) to
+make a separate call about. Relatedly, `src/actions::dispatch` -- the one
+path both chat's data-mode write tools and the UI's own buttons go
+through -- has no delete-capable action at all (`KNOWN_ACTIONS` in
+`src/app_definition/mod.rs` has no `*.delete`); the only thing that deletes
+a task row is `Undo::DeleteTask`, reachable only by undoing the exact
+`task.create` that made it. So a `member`, who can't call the HTTP DELETE
+route, has no path to deleting anything via chat either. Workspace
+deletion, if it's ever added, should stay `owner`-only per the original
+plan -- nothing in the matrix update says otherwise, and no such endpoint
+exists today.
 
 Who may change a role is one function, `Role::can_assign(actor, from, to)`
 (`src/control/workspaces.rs`), tested as a table in `src/members.rs`:

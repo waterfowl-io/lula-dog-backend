@@ -112,8 +112,9 @@ pub struct WorkspaceIdParam {
 }
 
 /// `axum::middleware::from_fn_with_state` layer for every `/w/{workspace_id}`
-/// route: resolves membership, 403s a non-member or a viewer attempting a
-/// write, and opens the workspace's SQLite pool.
+/// route: resolves membership, 403s a non-member, a viewer attempting any
+/// write, or a member attempting a DELETE, and opens the workspace's SQLite
+/// pool.
 pub async fn scope(
     auth_user: AuthUser,
     Path(WorkspaceIdParam { workspace_id }): Path<WorkspaceIdParam>,
@@ -122,11 +123,14 @@ pub async fn scope(
     next: Next,
 ) -> Result<Response, AppError> {
     let role = resolve_role(&state, workspace_id, auth_user.id).await?;
-    let is_write = !matches!(
+    if *request.method() == Method::DELETE {
+        // Nolan's matrix (2026-10-25): `admin`+ deletes ANY workspace-level
+        // resource, not just invites/members -- see `Role`'s doc comment.
+        role.require(Role::Admin)?;
+    } else if !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
-    );
-    if is_write {
+    ) {
         role.require(Role::Member)?;
     }
     let pool = state
