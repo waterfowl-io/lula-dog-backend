@@ -1,7 +1,7 @@
 //! `cargo run --release --example actor_bench -- <mode>`: benchmark and
 //! crash-test harness for the workspace actor (`src/actor/mod.rs`) against
 //! today's direct `actions::dispatch` path. Modes: `latency`, `batch`,
-//! `wake`, `crash`, `litestream`, `all`. `crash-child` is an internal
+//! `wake`, `crash`, `litestream`, `partitions`, `all`. `crash-child` is an internal
 //! subcommand the `crash` mode spawns itself as; it is not a mode to run
 //! directly.
 
@@ -11,6 +11,7 @@ mod crash;
 mod crash_child;
 mod latency;
 mod litestream;
+mod partitions;
 mod wake;
 
 use std::fmt::Write as _;
@@ -83,16 +84,18 @@ async fn main() -> anyhow::Result<()> {
         "wake" => serde_json::json!({ "wake": wake::run().await? }),
         "crash" => serde_json::json!({ "crash": crash::run().await? }),
         "litestream" => serde_json::json!({ "litestream": litestream::run().await? }),
+        "partitions" => serde_json::json!({ "partitions": partitions::run().await? }),
         "all" => serde_json::json!({
             "latency": latency::run().await?,
             "batch": batch::run().await?,
             "wake": wake::run().await?,
             "crash": crash::run().await?,
             "litestream": litestream::run().await?,
+            "partitions": partitions::run().await?,
         }),
         other => {
             eprintln!(
-                "unknown mode {other:?}; expected one of: latency, batch, wake, crash, litestream, all"
+                "unknown mode {other:?}; expected one of: latency, batch, wake, crash, litestream, partitions, all"
             );
             std::process::exit(2);
         }

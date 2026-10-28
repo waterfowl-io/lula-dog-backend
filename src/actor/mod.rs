@@ -9,6 +9,8 @@
 //! Litestream wiring. See `actor-design.md` §§0, 1, 4, 5, 8 for the full
 //! design and what's deliberately out of scope here.
 
+pub mod partition;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

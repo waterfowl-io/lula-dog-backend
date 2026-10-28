@@ -104,3 +104,24 @@ Limitation: recovery time is measured after an integrity-check connection alread
 
 ## Checks
 `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features --locked -D warnings`, and `cargo test --locked` all pass. The tests include `tests/actor.rs`.
+
+## Addendum (2026-10-28 ~10:40 CDT): key partitions — `actor_bench partitions`
+Raw output: `bench-raw-partitions.txt`. Uses the DuckDB 2.0.0 CLI with `sqlite_scanner`; the extension was installed from a local file because the box blocks plain-HTTP extension downloads. Code: `src/actor/partition.rs` (`PartitionKey`, validated paths, `fanout_attach_sql`, 3 unit tests) plus `examples/actor_bench/partitions.rs`.
+
+**Correctness: PASS.** The setup was workspace A with shared + `user/u1` + `user/u2`, and workspace B with `user/u1` (the same key as in A).
+- Isolation: each file holds only its own rows, and A/u1 and B/u1 are different files.
+- Atomic within a partition: a 3-command batch whose third command fails applied nothing (u1 stayed at 5 rows).
+- The fan-out builder refuses a partition from workspace B (`CrossWorkspace`), and the key `../../other` is rejected.
+- The DuckDB fan-out over A's 3 partitions returns exactly `{shared: 2 rows / 200, u1: 5 / 5000, u2: 7 / 70000}`, with no B rows.
+- An `INSERT` through the `READ_ONLY` attach fails, and the row count is unchanged.
+- Separately verified: after `SET enable_external_access=false; SET lock_configuration=true`, a further `ATTACH` or `read_csv('/etc/passwd')` fails, and the setting can't be re-enabled.
+
+**Scale.** Each case has shared + N user partitions, 200 deals each, with live actors (WAL readers). The DuckDB fan-out is a `UNION ALL` count/sum, 5 reps per case.
+
+| user partitions | files | wake p50 / p95 | fan-out p50 / p95 | net of the 65 ms CLI start + LOAD | db+wal bytes |
+|---|---|---|---|---|---|
+| 2 | 3 | 5.4 / 5.4 ms | 79 / 81 ms | ~14 ms | 1.4 MB |
+| 50 | 51 | 6.6 / 11.2 ms | 162 / 166 ms | ~96 ms | 24.6 MB |
+| 200 | 201 | 6.0 / 9.4 ms | 400 / 401 ms | ~335 ms | 96.9 MB |
+
+Fan-out costs about 1.7 ms per attached partition, and the results were correct in every rep. Not covered: in-process DuckDB with cached attachments, Litestream across many files, re-partition migrations, and transfer sagas.
