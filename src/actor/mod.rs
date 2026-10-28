@@ -325,7 +325,13 @@ async fn handle_cmd(
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
     match apply_cmd_body(conn, id, action, args).await {
         Ok(reply) => {
-            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                // A failed COMMIT (disk full, I/O error) can leave the
+                // connection inside the transaction; roll back so the next
+                // `BEGIN IMMEDIATE` doesn't fail forever.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(e.into());
+            }
             if reply.outbox_seq >= 0 {
                 let _ = outbox_tx.send(reply.outbox_seq);
             }
@@ -348,7 +354,13 @@ async fn handle_batch(
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
     match apply_batch_body(conn, id, commands).await {
         Ok(reply) => {
-            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                // A failed COMMIT (disk full, I/O error) can leave the
+                // connection inside the transaction; roll back so the next
+                // `BEGIN IMMEDIATE` doesn't fail forever.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(e.into());
+            }
             if reply.outbox_seq >= 0 {
                 let _ = outbox_tx.send(reply.outbox_seq);
             }
@@ -416,6 +428,7 @@ async fn handle_group(
             }
         }
         Err(e) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             let msg = format!("group commit failed: {e}");
             for (reply, _) in outcomes {
                 let _ = reply.send(Err(AppError::Internal(msg.clone())));
@@ -454,7 +467,24 @@ async fn run_loop(
 ) {
     loop {
         match next_msg(&mut interactive_rx, &mut batch_rx, config.idle_timeout).await {
-            Next::Idle => break,
+            Next::Idle => {
+                // Close both mailboxes first so no new message can arrive,
+                // then apply anything that raced in before the close: a
+                // caller that got a message into the queue must get a real
+                // reply, not a spurious "actor unavailable".
+                interactive_rx.close();
+                batch_rx.close();
+                while let Ok(cmd) = interactive_rx.try_recv() {
+                    let result =
+                        handle_cmd(&mut conn, &outbox_tx, cmd.id, &cmd.action, &cmd.args).await;
+                    let _ = cmd.reply.send(result);
+                }
+                while let Ok(msg) = batch_rx.try_recv() {
+                    let result = handle_batch(&mut conn, &outbox_tx, msg.id, &msg.commands).await;
+                    let _ = msg.reply.send(result);
+                }
+                break;
+            }
             Next::Batch(msg) => {
                 let result = handle_batch(&mut conn, &outbox_tx, msg.id, &msg.commands).await;
                 let _ = msg.reply.send(result);
@@ -566,5 +596,27 @@ impl ActorRegistry {
         let handle = WorkspaceActor::spawn(path, self.config.clone()).await?;
         *guard = Some(handle.clone());
         Ok(handle)
+    }
+
+    /// Send one command to `id`'s actor, waking it if needed. If the handle
+    /// went stale between lookup and send (the actor idled out in that
+    /// window), wake again and retry once: the command id makes the retry
+    /// safe even if the first attempt was applied.
+    pub async fn send(
+        &self,
+        id: Uuid,
+        cmd_id: Uuid,
+        action: &str,
+        args: Value,
+    ) -> AppResult<Reply> {
+        let wake = |e: anyhow::Error| AppError::Internal(format!("waking workspace actor: {e}"));
+        let handle = self.get_or_wake(id).await.map_err(wake)?;
+        match handle.send(cmd_id, action, args.clone()).await {
+            Err(AppError::ServiceUnavailable(_)) => {
+                let handle = self.get_or_wake(id).await.map_err(wake)?;
+                handle.send(cmd_id, action, args).await
+            }
+            other => other,
+        }
     }
 }
