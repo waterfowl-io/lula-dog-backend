@@ -112,18 +112,32 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(task)))
 }
 
-/// `insert` plus the opportunity-exists check, from a pool rather than a
-/// borrowed connection -- the one entry point both the HTTP handler and
-/// `crate::actions::dispatch` (chat's `task.create` tool) call.
+/// `insert` plus the opportunity-exists check, on a borrowed connection --
+/// the one entry point both the HTTP handler (via `create_via_pool`) and
+/// the workspace actor's `crate::actions::dispatch_in` (chat's
+/// `task.create` tool) call.
+pub async fn create_in(
+    conn: &mut SqliteConnection,
+    opportunity_id: i64,
+    raw_title: &str,
+    raw_due_at: Option<&str>,
+) -> AppResult<Task> {
+    opportunities::fetch(conn, opportunity_id).await?;
+    insert(conn, opportunity_id, raw_title, raw_due_at, None).await
+}
+
+/// `create_in`, from a pool rather than a borrowed connection, in its own
+/// transaction.
 pub async fn create_via_pool(
     pool: &SqlitePool,
     opportunity_id: i64,
     raw_title: &str,
     raw_due_at: Option<&str>,
 ) -> AppResult<Task> {
-    let mut conn = pool.acquire().await?;
-    opportunities::fetch(&mut conn, opportunity_id).await?;
-    insert(&mut conn, opportunity_id, raw_title, raw_due_at, None).await
+    let mut tx = pool.begin().await?;
+    let task = create_in(&mut tx, opportunity_id, raw_title, raw_due_at).await?;
+    tx.commit().await?;
+    Ok(task)
 }
 
 /// A partial update. `"due_at": null` clears the due date.
@@ -161,12 +175,13 @@ pub async fn patch(
     Ok(Json(new))
 }
 
-/// `patch`'s logic, from a pool rather than a borrowed connection, also
-/// returning the task as it stood before the patch -- what an undo (chat's
-/// `task.complete` tool) needs to revert `done`. The one entry point both
-/// the HTTP handler and `crate::actions::dispatch` call.
-pub async fn apply_patch_via_pool(
-    pool: &SqlitePool,
+/// `patch`'s logic, on a borrowed connection, also returning the task as it
+/// stood before the patch -- what an undo (chat's `task.complete` tool)
+/// needs to revert `done`. The one entry point both the HTTP handler (via
+/// `apply_patch_via_pool`) and the workspace actor's
+/// `crate::actions::dispatch_in`/`undo_in` call.
+pub async fn apply_patch_in(
+    conn: &mut SqliteConnection,
     id: i64,
     patch: TaskPatch,
 ) -> AppResult<(Task, Task)> {
@@ -175,8 +190,7 @@ pub async fn apply_patch_via_pool(
         due_at: patch_due_at,
         done: patch_done,
     } = patch;
-    let mut conn = pool.acquire().await?;
-    let current = fetch(&mut conn, id).await?;
+    let current = fetch(conn, id).await?;
     let new_title = match patch_title {
         Some(t) => title(&t)?,
         None => current.title.clone(),
@@ -193,9 +207,22 @@ pub async fn apply_patch_via_pool(
     .bind(new_due_at)
     .bind(new_done)
     .bind(id)
-    .fetch_one(&mut *conn)
+    .fetch_one(conn)
     .await?;
     Ok((current, new))
+}
+
+/// `apply_patch_in`, from a pool rather than a borrowed connection, in its
+/// own transaction.
+pub async fn apply_patch_via_pool(
+    pool: &SqlitePool,
+    id: i64,
+    patch: TaskPatch,
+) -> AppResult<(Task, Task)> {
+    let mut tx = pool.begin().await?;
+    let result = apply_patch_in(&mut tx, id, patch).await?;
+    tx.commit().await?;
+    Ok(result)
 }
 
 /// Delete a task.
@@ -217,18 +244,26 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `delete`'s logic, from a pool rather than a borrowed connection -- also
-/// used to undo chat's `task.create` tool (undoing a task creation deletes
-/// it outright; there is no soft-delete state to go back to).
-pub async fn delete_via_pool(pool: &SqlitePool, id: i64) -> AppResult<()> {
-    let mut conn = pool.acquire().await?;
+/// `delete`'s logic, on a borrowed connection -- also used to undo chat's
+/// `task.create` tool (undoing a task creation deletes it outright; there
+/// is no soft-delete state to go back to).
+pub async fn delete_in(conn: &mut SqliteConnection, id: i64) -> AppResult<()> {
     let deleted = sqlx::query("DELETE FROM tasks WHERE id = ?1")
         .bind(id)
-        .execute(&mut *conn)
+        .execute(conn)
         .await?
         .rows_affected();
     if deleted == 0 {
         return Err(AppError::NotFound("task"));
     }
+    Ok(())
+}
+
+/// `delete_in`, from a pool rather than a borrowed connection, in its own
+/// transaction.
+pub async fn delete_via_pool(pool: &SqlitePool, id: i64) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    delete_in(&mut tx, id).await?;
+    tx.commit().await?;
     Ok(())
 }

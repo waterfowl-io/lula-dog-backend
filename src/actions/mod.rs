@@ -19,7 +19,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, to_value};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::error::{AppError, AppResult};
 use crate::leads::{self, LeadStatus};
@@ -103,26 +103,28 @@ fn split_id(action: &str, raw: &Value, id_field: &str) -> AppResult<(i64, Value)
 }
 
 /// Apply a named action with its JSON args, exactly as the matching HTTP
-/// endpoint would. Actions reachable only via a dedicated undo flow
+/// endpoint would, on a borrowed connection (no transaction management --
+/// the caller, e.g. the workspace actor, owns the transaction this runs
+/// inside). Actions reachable only via a dedicated undo flow
 /// (`proposal.unaccept`/`proposal.unreject`) and `paste.submit` (which needs
-/// an `Extractor`, not just a pool) are not dispatchable here; see the
+/// an `Extractor`, not just a connection) are not dispatchable here; see the
 /// module doc comment.
-pub async fn dispatch(
-    pool: &SqlitePool,
+pub async fn dispatch_in(
+    conn: &mut SqliteConnection,
     action: &str,
     raw_args: &Value,
 ) -> AppResult<ActionOutcome> {
     match action {
         "opportunity.create" => {
             let new: NewOpportunity = parse_args(action, raw_args)?;
-            let view = opportunities::create_via_pool(pool, new).await?;
+            let view = opportunities::create_in(conn, new).await?;
             // Not undoable: there is no delete capability for an opportunity.
             Ok(ActionOutcome::new(to_json(&view)?))
         }
         "opportunity.update" | "opportunity.update_stage" => {
             let (id, rest) = split_id(action, raw_args, "opportunity_id")?;
             let patch: OpportunityPatch = parse_args(action, &rest)?;
-            let (view, changes) = opportunities::apply_patch_via_pool(pool, id, patch).await?;
+            let (view, changes) = opportunities::apply_patch_in(conn, id, patch).await?;
             let outcome = to_json(&view)?;
             Ok(if changes.is_empty() {
                 ActionOutcome::new(outcome)
@@ -139,8 +141,7 @@ pub async fn dispatch(
             let (opportunity_id, rest) = split_id(action, raw_args, "opportunity_id")?;
             let new: NewTask = parse_args(action, &rest)?;
             let task =
-                tasks::create_via_pool(pool, opportunity_id, &new.title, new.due_at.as_deref())
-                    .await?;
+                tasks::create_in(conn, opportunity_id, &new.title, new.due_at.as_deref()).await?;
             Ok(ActionOutcome::with_undo(
                 to_json(&task)?,
                 Undo::DeleteTask { task_id: task.id },
@@ -149,7 +150,7 @@ pub async fn dispatch(
         "task.complete" => {
             let (task_id, rest) = split_id(action, raw_args, "task_id")?;
             let patch: TaskPatch = parse_args(action, &rest)?;
-            let (old, new) = tasks::apply_patch_via_pool(pool, task_id, patch).await?;
+            let (old, new) = tasks::apply_patch_in(conn, task_id, patch).await?;
             Ok(ActionOutcome::with_undo(
                 to_json(&new)?,
                 Undo::SetTaskDone {
@@ -160,21 +161,21 @@ pub async fn dispatch(
         }
         "lead.accept" => {
             let (lead_id, _rest) = split_id(action, raw_args, "lead_id")?;
-            let response = leads::accept_via_pool(pool, lead_id).await?;
-            // Not undoable: see `leads::accept_via_pool`'s doc comment.
+            let response = leads::accept_in(conn, lead_id).await?;
+            // Not undoable: see `leads::accept_in`'s doc comment.
             Ok(ActionOutcome::new(to_json(&response)?))
         }
         "lead.reject" => {
             let (lead_id, rest) = split_id(action, raw_args, "lead_id")?;
             let a: LeadRejectArgs = parse_args(action, &rest)?;
-            let lead = leads::reject_via_pool(pool, lead_id, &a.reason).await?;
-            // Not undoable: see `leads::reject_via_pool`'s doc comment.
+            let lead = leads::reject_in(conn, lead_id, &a.reason).await?;
+            // Not undoable: see `leads::reject_in`'s doc comment.
             Ok(ActionOutcome::new(to_json(&lead)?))
         }
         "lead.snooze" => {
             let (lead_id, rest) = split_id(action, raw_args, "lead_id")?;
             let a: LeadSnoozeArgs = parse_args(action, &rest)?;
-            let (prior, new) = leads::snooze_via_pool(pool, lead_id, &a.until).await?;
+            let (prior, new) = leads::snooze_in(conn, lead_id, &a.until).await?;
             Ok(ActionOutcome::with_undo(
                 to_json(&new)?,
                 Undo::RestoreLead {
@@ -187,7 +188,7 @@ pub async fn dispatch(
         }
         "proposal.accept" => {
             let (id, _rest) = split_id(action, raw_args, "proposal_id")?;
-            let response = proposals::accept_via_pool(pool, id).await?;
+            let response = proposals::accept_in(conn, id).await?;
             Ok(ActionOutcome::with_undo(
                 to_json(&response)?,
                 Undo::UnacceptProposal { proposal_id: id },
@@ -195,7 +196,7 @@ pub async fn dispatch(
         }
         "proposal.reject" => {
             let (id, _rest) = split_id(action, raw_args, "proposal_id")?;
-            let change = proposals::reject_via_pool(pool, id).await?;
+            let change = proposals::reject_in(conn, id).await?;
             Ok(ActionOutcome::with_undo(
                 to_json(&change)?,
                 Undo::UnrejectProposal { proposal_id: id },
@@ -205,6 +206,19 @@ pub async fn dispatch(
             "action `{other}` is not available via chat"
         ))),
     }
+}
+
+/// `dispatch_in`, from a pool rather than a borrowed connection, in its own
+/// transaction.
+pub async fn dispatch(
+    pool: &SqlitePool,
+    action: &str,
+    raw_args: &Value,
+) -> AppResult<ActionOutcome> {
+    let mut tx = pool.begin().await?;
+    let outcome = dispatch_in(&mut tx, action, raw_args).await?;
+    tx.commit().await?;
+    Ok(outcome)
 }
 
 #[derive(Deserialize)]
@@ -219,22 +233,23 @@ struct LeadSnoozeArgs {
     until: String,
 }
 
-/// Reverse an applied action. Each variant calls the same reversal logic an
-/// equivalent person-driven undo would (see the module doc comment); all of
-/// them are safe to retry/replay only once -- a second call sees the
-/// already-reverted state and returns a conflict, the same guard the
-/// existing `unaccept`/`unreject` endpoints already rely on.
-pub async fn undo(pool: &SqlitePool, undo: &Undo) -> AppResult<Value> {
+/// Reverse an applied action, on a borrowed connection (no transaction
+/// management -- see `dispatch_in`). Each variant calls the same reversal
+/// logic an equivalent person-driven undo would (see the module doc
+/// comment); all of them are safe to retry/replay only once -- a second
+/// call sees the already-reverted state and returns a conflict, the same
+/// guard the existing `unaccept`/`unreject` endpoints already rely on.
+pub async fn undo_in(conn: &mut SqliteConnection, undo: &Undo) -> AppResult<Value> {
     match undo {
         Undo::OpportunityFields { change_ids } => {
             let mut reverted = Vec::with_capacity(change_ids.len());
             for id in change_ids {
-                reverted.push(proposals::unaccept_via_pool(pool, *id).await?);
+                reverted.push(proposals::unaccept_in(conn, *id).await?);
             }
             to_json(&reverted)
         }
         Undo::DeleteTask { task_id } => {
-            tasks::delete_via_pool(pool, *task_id).await?;
+            tasks::delete_in(conn, *task_id).await?;
             Ok(Value::Null)
         }
         Undo::SetTaskDone { task_id, done } => {
@@ -243,7 +258,7 @@ pub async fn undo(pool: &SqlitePool, undo: &Undo) -> AppResult<Value> {
                 due_at: None,
                 done: Some(*done),
             };
-            let (_old, new) = tasks::apply_patch_via_pool(pool, *task_id, patch).await?;
+            let (_old, new) = tasks::apply_patch_in(conn, *task_id, patch).await?;
             to_json(&new)
         }
         Undo::RestoreLead {
@@ -252,8 +267,8 @@ pub async fn undo(pool: &SqlitePool, undo: &Undo) -> AppResult<Value> {
             reject_reason,
             snoozed_until,
         } => {
-            let restored = leads::restore_via_pool(
-                pool,
+            let restored = leads::restore_in(
+                conn,
                 *lead_id,
                 *status,
                 reject_reason.as_deref(),
@@ -263,10 +278,19 @@ pub async fn undo(pool: &SqlitePool, undo: &Undo) -> AppResult<Value> {
             to_json(&restored)
         }
         Undo::UnacceptProposal { proposal_id } => {
-            to_json(&proposals::unaccept_via_pool(pool, *proposal_id).await?)
+            to_json(&proposals::unaccept_in(conn, *proposal_id).await?)
         }
         Undo::UnrejectProposal { proposal_id } => {
-            to_json(&proposals::unreject_via_pool(pool, *proposal_id).await?)
+            to_json(&proposals::unreject_in(conn, *proposal_id).await?)
         }
     }
+}
+
+/// `undo_in`, from a pool rather than a borrowed connection, in its own
+/// transaction.
+pub async fn undo(pool: &SqlitePool, undo: &Undo) -> AppResult<Value> {
+    let mut tx = pool.begin().await?;
+    let result = undo_in(&mut tx, undo).await?;
+    tx.commit().await?;
+    Ok(result)
 }

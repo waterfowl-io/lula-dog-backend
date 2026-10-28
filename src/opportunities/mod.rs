@@ -238,14 +238,25 @@ fn norm(field: Field, value: Option<&str>) -> AppResult<Option<String>> {
     field.normalize(value).map_err(AppError::BadRequest)
 }
 
-/// `insert` plus the view fetch, from a pool rather than a borrowed
-/// connection -- the one entry point both the HTTP handler and
-/// `crate::actions::dispatch` (chat's `opportunity.create` tool) call, so
-/// the two can never validate differently.
+/// `insert` plus the view fetch, on a borrowed connection -- the one entry
+/// point both the HTTP handler (via `create_via_pool`) and the workspace
+/// actor's `crate::actions::dispatch_in` (chat's `opportunity.create` tool)
+/// call, so the two can never validate differently.
+pub async fn create_in(
+    conn: &mut SqliteConnection,
+    new: NewOpportunity,
+) -> AppResult<OpportunityView> {
+    let created = insert(conn, new).await?;
+    fetch_view(conn, created.id).await
+}
+
+/// `create_in`, from a pool rather than a borrowed connection, in its own
+/// transaction.
 pub async fn create_via_pool(pool: &SqlitePool, new: NewOpportunity) -> AppResult<OpportunityView> {
-    let mut conn = pool.acquire().await?;
-    let created = insert(&mut conn, new).await?;
-    fetch_view(&mut conn, created.id).await
+    let mut tx = pool.begin().await?;
+    let view = create_in(&mut tx, new).await?;
+    tx.commit().await?;
+    Ok(view)
 }
 
 /// Create an opportunity.
@@ -404,29 +415,41 @@ pub async fn patch(
     Ok(Json(view))
 }
 
-/// `patch`'s logic, from a pool rather than a borrowed transaction, also
-/// returning the `FieldChange` each actually-changed field produced (each
-/// one's `old_value` is exactly what an undo needs to revert it). The one
-/// entry point both the HTTP handler and `crate::actions::dispatch` (chat's
+/// `patch`'s logic, on a borrowed connection, also returning the
+/// `FieldChange` each actually-changed field produced (each one's
+/// `old_value` is exactly what an undo needs to revert it). The one entry
+/// point both the HTTP handler (via `apply_patch_via_pool`) and the
+/// workspace actor's `crate::actions::dispatch_in` (chat's
 /// `opportunity.update`/`opportunity.update_stage` tools) call.
+pub async fn apply_patch_in(
+    conn: &mut SqliteConnection,
+    id: i64,
+    patch: OpportunityPatch,
+) -> AppResult<(OpportunityView, Vec<FieldChange>)> {
+    let mut current = fetch(conn, id).await?;
+    let mut changes = Vec::new();
+    for (field, value) in patch.changes() {
+        let value = norm(field, value.as_deref())?;
+        if let Some(change) =
+            proposals::set_field(conn, &current, field, value.as_deref(), None, None).await?
+        {
+            changes.push(change);
+        }
+        current = fetch(conn, id).await?;
+    }
+    let view = fetch_view(conn, id).await?;
+    Ok((view, changes))
+}
+
+/// `apply_patch_in`, from a pool rather than a borrowed connection, in its
+/// own transaction.
 pub async fn apply_patch_via_pool(
     pool: &SqlitePool,
     id: i64,
     patch: OpportunityPatch,
 ) -> AppResult<(OpportunityView, Vec<FieldChange>)> {
     let mut tx = pool.begin().await?;
-    let mut current = fetch(&mut tx, id).await?;
-    let mut changes = Vec::new();
-    for (field, value) in patch.changes() {
-        let value = norm(field, value.as_deref())?;
-        if let Some(change) =
-            proposals::set_field(&mut tx, &current, field, value.as_deref(), None, None).await?
-        {
-            changes.push(change);
-        }
-        current = fetch(&mut tx, id).await?;
-    }
-    let view = fetch_view(&mut tx, id).await?;
+    let result = apply_patch_in(&mut tx, id, patch).await?;
     tx.commit().await?;
-    Ok((view, changes))
+    Ok(result)
 }

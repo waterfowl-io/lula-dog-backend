@@ -337,18 +337,26 @@ pub async fn accept(
     Ok(Json(accept_via_pool(&ws.pool, id).await?))
 }
 
-/// `accept`'s logic, from a pool rather than a borrowed transaction -- the
-/// one entry point both the HTTP handler and `crate::actions::dispatch`
-/// (chat's `proposal.accept` tool) call. Undo reuses `unaccept_via_pool`.
-pub async fn accept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<AcceptResponse> {
-    let mut tx = pool.begin().await?;
-    let proposal = accept_one(&mut tx, id).await?;
-    let opportunity = opportunities::fetch_view(&mut tx, proposal.opportunity_id).await?;
-    tx.commit().await?;
+/// `accept`'s logic, on a borrowed connection -- the one entry point both
+/// the HTTP handler (via `accept_via_pool`) and the workspace actor's
+/// `crate::actions::dispatch_in` (chat's `proposal.accept` tool) call. Undo
+/// reuses `unaccept_in`.
+pub async fn accept_in(conn: &mut SqliteConnection, id: i64) -> AppResult<AcceptResponse> {
+    let proposal = accept_one(conn, id).await?;
+    let opportunity = opportunities::fetch_view(conn, proposal.opportunity_id).await?;
     Ok(AcceptResponse {
         proposal,
         opportunity,
     })
+}
+
+/// `accept_in`, from a pool rather than a borrowed connection, in its own
+/// transaction.
+pub async fn accept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<AcceptResponse> {
+    let mut tx = pool.begin().await?;
+    let response = accept_in(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok(response)
 }
 
 /// Reject a proposal. The opportunity is unchanged.
@@ -370,18 +378,21 @@ pub async fn reject(
     Ok(Json(reject_via_pool(&ws.pool, id).await?))
 }
 
-/// `reject`'s logic, from a pool rather than a borrowed transaction -- the
-/// one entry point both the HTTP handler and `crate::actions::dispatch`
-/// (chat's `proposal.reject` tool) call. Undo reuses `unreject_via_pool`.
+/// `reject`'s logic, on a borrowed connection -- the one entry point both
+/// the HTTP handler (via `reject_via_pool`) and the workspace actor's
+/// `crate::actions::dispatch_in` (chat's `proposal.reject` tool) call. Undo
+/// reuses `unreject_in`.
+pub async fn reject_in(conn: &mut SqliteConnection, id: i64) -> AppResult<FieldChange> {
+    let change = resolve(conn, id, ChangeStatus::Rejected).await?;
+    write_dismissal_notes(conn, change.opportunity_id, std::slice::from_ref(&change)).await?;
+    Ok(change)
+}
+
+/// `reject_in`, from a pool rather than a borrowed connection, in its own
+/// transaction.
 pub async fn reject_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
     let mut tx = pool.begin().await?;
-    let change = resolve(&mut tx, id, ChangeStatus::Rejected).await?;
-    write_dismissal_notes(
-        &mut tx,
-        change.opportunity_id,
-        std::slice::from_ref(&change),
-    )
-    .await?;
+    let change = reject_in(&mut tx, id).await?;
     tx.commit().await?;
     Ok(change)
 }
@@ -407,11 +418,11 @@ pub async fn unreject(
     Ok(Json(unreject_via_pool(&ws.pool, id).await?))
 }
 
-/// `unreject`'s logic, from a pool rather than a borrowed connection -- the
-/// one entry point both the HTTP handler and chat's undo endpoint (reversing
-/// a `proposal.reject` tool call) call.
-pub async fn unreject_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
-    let mut conn = pool.acquire().await?;
+/// `unreject`'s logic, on a borrowed connection -- the one entry point both
+/// the HTTP handler (via `unreject_via_pool`) and chat's undo endpoint
+/// (reversing a `proposal.reject` tool call, via `crate::actions::undo_in`)
+/// call.
+pub async fn unreject_in(conn: &mut SqliteConnection, id: i64) -> AppResult<FieldChange> {
     let claimed = sqlx::query_as::<_, FieldChange>(
         "UPDATE field_changes SET status = 'proposed'
          WHERE id = ?1 AND status = 'rejected'
@@ -434,6 +445,15 @@ pub async fn unreject_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldCha
             status.as_str()
         ))
     }))
+}
+
+/// `unreject_in`, from a pool rather than a borrowed connection, in its own
+/// transaction.
+pub async fn unreject_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
+    let mut tx = pool.begin().await?;
+    let change = unreject_in(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok(change)
 }
 
 /// Undo a just-accepted proposal within the frontend's short "Undo" window:
@@ -459,27 +479,27 @@ pub async fn unaccept(
     Ok(Json(unaccept_via_pool(&ws.pool, id).await?))
 }
 
-/// `unaccept`'s logic, from a pool rather than a borrowed transaction -- the
-/// one entry point both the HTTP handler and chat's undo endpoint (reversing
-/// a `proposal.accept` tool call) call.
-pub async fn unaccept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
-    let mut tx = pool.begin().await?;
+/// `unaccept`'s logic, on a borrowed connection -- the one entry point both
+/// the HTTP handler (via `unaccept_via_pool`) and chat's undo endpoint
+/// (reversing a `proposal.accept` tool call, via `crate::actions::undo_in`)
+/// call.
+pub async fn unaccept_in(conn: &mut SqliteConnection, id: i64) -> AppResult<FieldChange> {
     let change: FieldChange = sqlx::query_as("SELECT * FROM field_changes WHERE id = ?1")
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?
         .ok_or(AppError::NotFound("proposal"))?;
     if change.status != ChangeStatus::Accepted {
         return Err(AppError::Conflict(format!("proposal {id} is not accepted")));
     }
-    let opportunity = opportunities::fetch(&mut tx, change.opportunity_id).await?;
+    let opportunity = opportunities::fetch(conn, change.opportunity_id).await?;
     if opportunity.get(change.field).as_deref() != change.new_value.as_deref() {
         return Err(AppError::Conflict(format!(
             "proposal {id} can't be undone: the field changed again since it was accepted"
         )));
     }
     apply(
-        &mut tx,
+        conn,
         change.opportunity_id,
         change.field,
         change.old_value.as_deref(),
@@ -489,9 +509,17 @@ pub async fn unaccept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldCha
         "UPDATE field_changes SET status = 'proposed' WHERE id = ?1 AND status = 'accepted' RETURNING *",
     )
     .bind(id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| AppError::Conflict(format!("proposal {id} is no longer accepted")))?;
+    Ok(reverted)
+}
+
+/// `unaccept_in`, from a pool rather than a borrowed connection, in its own
+/// transaction.
+pub async fn unaccept_via_pool(pool: &SqlitePool, id: i64) -> AppResult<FieldChange> {
+    let mut tx = pool.begin().await?;
+    let reverted = unaccept_in(&mut tx, id).await?;
     tx.commit().await?;
     Ok(reverted)
 }
