@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 # Web
 axum = { version = "0.8", features = ["macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # Adapts a `tokio::sync::mpsc::Receiver` into a `futures_core::Stream` for
