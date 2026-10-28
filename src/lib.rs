@@ -4,6 +4,7 @@
 //! workspace's editable data. See `docs/architecture.md`.
 
 pub mod actions;
+pub mod actor;
 pub mod alerts;
 pub mod app_definition;
 pub mod apps;
