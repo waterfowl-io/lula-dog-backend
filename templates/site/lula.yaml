@@ -1,0 +1,10 @@
+name: lula-site-template
+version: 1
+
+settings:
+  sdk:
+    baseUrl: ""
+    mode: mock
+
+storage:
+  engine: sqlite

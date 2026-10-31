@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  site-template:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: templates/site
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: ./dev/lula-site-test lint
+      - run: ./dev/lula-site-test unit
+      - run: ./dev/lula-site-test integration
+      - run: ./dev/lula-site-test build
+
+  site-template-e2e:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: templates/site
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: ./dev/lula-site-test e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-test-results
+          path: templates/site/test-results/e2e
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: templates/site/playwright-report
+          if-no-files-found: ignore
