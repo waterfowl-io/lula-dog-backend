@@ -5,7 +5,14 @@ import { readdirSync, readFileSync, lstatSync, existsSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const IGNORED_TOP_LEVEL = new Set(["node_modules", "dist", ".git", "coverage"]);
+const IGNORED_TOP_LEVEL = new Set([
+  "node_modules",
+  "dist",
+  ".git",
+  "coverage",
+  "test-results",
+  "playwright-report",
+]);
 
 const ALLOWED_TOP_LEVEL_DIRS = new Set([
   "app",
@@ -28,6 +35,7 @@ const ALLOWED_TOP_LEVEL_FILES = new Set([
   "README.md",
   "vite.config.ts",
   "vitest.config.ts",
+  "playwright.config.ts",
 ]);
 
 const REQUIRED_PATHS = [

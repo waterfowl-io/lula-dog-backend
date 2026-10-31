@@ -13,7 +13,13 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run test:unit && npm run test:integration",
     "test:unit": "vitest run tests/unit --coverage",
-    "test:integration": "vitest run tests/integration"
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "playwright test",
+    "e2e:actor": "tsx tests/support/serve-actor.ts",
+    "e2e:build:fake": "vite build --outDir dist/e2e-fake",
+    "e2e:preview:fake": "vite preview --outDir dist/e2e-fake --port 4173 --strictPort --host 127.0.0.1",
+    "e2e:build:http": "vite build --outDir dist/e2e-http",
+    "e2e:preview:http": "vite preview --outDir dist/e2e-http --port 4174 --strictPort --host 127.0.0.1"
   },
   "dependencies": {
     "@lula/sdk": "*",
@@ -21,6 +27,7 @@
     "react-dom": "^19.3.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^26.6.6",
     "@types/react": "^19.3.0",
@@ -30,6 +37,7 @@
     "@vitest/coverage-v8": "^3.2.7",
     "sql.js": "^1.15.2",
     "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vite": "^8.3.5",
     "vitest": "^3.2.7"

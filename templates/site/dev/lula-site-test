@@ -6,7 +6,8 @@
 //   unit        - unit tests (tests/unit, mock-mode SDK, no network/fs)
 //   integration - integration tests (tests/integration, real sqlite actor)
 //   build       - production build + hashed-asset check
-//   all         - lint, unit, integration, build, in order, fail-fast
+//   e2e         - Playwright e2e tests (tests/e2e, built preview, chromium)
+//   all         - lint, unit, integration, build, e2e, in order, fail-fast
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -29,6 +30,7 @@ const STEPS = {
   unit: () => run("npm", ["run", "test:unit"]),
   integration: () => run("npm", ["run", "test:integration"]),
   build: () => run("npm", ["run", "build"]),
+  e2e: () => run("npm", ["run", "test:e2e"]),
 };
 
 STEPS.all = () => {
@@ -36,6 +38,7 @@ STEPS.all = () => {
   STEPS.unit();
   STEPS.integration();
   STEPS.build();
+  STEPS.e2e();
 };
 
 const subcommand = process.argv[2];

@@ -110,6 +110,10 @@ export interface StartSqliteActorOptions {
   migrationsDir: string;
   seedPath?: string;
   dbPath?: string;
+  /** Port to listen on; defaults to an ephemeral port (0). */
+  port?: number;
+  /** Allowed browser origins (CORS). Used by the e2e server so the built preview can call it cross-origin. */
+  corsOrigins?: string[];
 }
 
 export function computeChecksum(content: string): string {
@@ -180,8 +184,21 @@ function readBody(req: import("node:http").IncomingMessage): Promise<string> {
   });
 }
 
-function createActorServer(db: SqliteDatabase): Server {
+function createActorServer(db: SqliteDatabase, corsOrigins: string[] = []): Server {
   return createServer((req, res) => {
+    const origin = req.headers.origin;
+    if (origin && corsOrigins.includes(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    }
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     if (req.method === "GET" && req.url === "/v1/me") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ id: "demo-user", name: "Demo User", email: "demo@example.com" }));
@@ -218,11 +235,11 @@ export function startSqliteActor(options: StartSqliteActorOptions): Promise<Sqli
     db.exec(readFileSync(options.seedPath, "utf8"));
   }
 
-  const server = createActorServer(db);
+  const server = createActorServer(db, options.corsOrigins);
 
   return new Promise((resolve, reject) => {
     server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(options.port ?? 0, "127.0.0.1", () => {
       const address = server.address();
       const port = typeof address === "object" && address ? address.port : 0;
       resolve({
